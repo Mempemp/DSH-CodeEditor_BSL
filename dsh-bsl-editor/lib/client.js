@@ -716,13 +716,6 @@ window.__ModuleLoader__.load({
         if (found) metaScrollRef.current = metaHighlight;
       }, [metaHighlight, metaExpanded, metaChildren, search]);
 
-      // Auto-hide the editor notice.
-      useEffect(() => {
-        if (!editorNotice) return;
-        const t = setTimeout(() => setEditorNotice(null), 7000);
-        return () => clearTimeout(t);
-      }, [editorNotice]);
-
       // Close the context menu on Escape.
       useEffect(() => {
         if (!ctxMenu) return;
@@ -899,7 +892,10 @@ window.__ModuleLoader__.load({
           ? () => { metaToggle(full); setMetaHighlight(nodeId); }
           : item.xmlFile
           ? () => {
-              setEditorNotice("Модуль «" + item.label + "» не найден. Откройте XML правой кнопкой мыши.");
+              // Empty editor with a centered notice — no floating popup.
+              if (modelRef.current) { modelRef.current.dispose?.(); modelRef.current = null; }
+              if (editorRef.current) editorRef.current.setModel(null);
+              setEditorNotice("Модуль «" + item.label + "» не найден.\nОткройте XML правой кнопкой мыши.");
               setMetaHighlight(nodeId);
             }
           : undefined;
@@ -965,7 +961,7 @@ window.__ModuleLoader__.load({
               : (rootTitle || "Проект") }),
             jsxs("div", { style: { display: "flex", gap: 4, padding: "0 4px 8px" }, children: [
               jsx("button", {
-                onClick: () => setMode("files"),
+                onClick: () => { setMode("files"); setEditorNotice(null); },
                 style: {
                   flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
                   font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
@@ -975,7 +971,7 @@ window.__ModuleLoader__.load({
                 children: "Файлы",
               }),
               jsx("button", {
-                onClick: () => setMode("meta"),
+                onClick: () => { setMode("meta"); setEditorNotice(null); },
                 style: {
                   flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
                   font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
@@ -1016,7 +1012,7 @@ window.__ModuleLoader__.load({
         }),
         jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
           !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13 }, children: "Загрузка редактора…" }) : null,
-          editorNotice ? jsx("div", { style: { position: "absolute", top: 10, left: 10, right: 10, zIndex: 10, padding: "10px 14px", borderRadius: 10, background: "rgba(244,67,54,.1)", border: "1px solid rgba(244,67,54,.45)", color: "var(--dsw-alias-label-primary)", font: "var(--dsw-font-s-14)", pointerEvents: "none", boxShadow: "0 4px 16px rgba(0,0,0,.25)" }, children: editorNotice }) : null,
+          editorNotice ? jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, textAlign: "center", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-secondary, #8a94a6)", opacity: 0.8, pointerEvents: "none", whiteSpace: "pre-wrap" }, children: editorNotice }) : null,
         ]}),
         ctxMenu ? jsxs(React.Fragment, { children: [
           jsx("div", { style: { position: "fixed", inset: 0, zIndex: 2147482900, background: "transparent" }, onMouseDown: () => setCtxMenu(null), onContextMenu: (e) => { e.preventDefault(); setCtxMenu(null); } }),
