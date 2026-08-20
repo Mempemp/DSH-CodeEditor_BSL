@@ -1,60 +1,101 @@
 # dsh-bsl-editor
 
-DeepSeek Harness plugin: a **1C:Enterprise (BSL) code editor** in one window.
+**Редактор кода 1С (BSL) прямо внутри DeepSeek Harness — одно окно, без code-server и Docker.**
 
-- File tree of the current DSH workspace — lazy-loading, git M/A/D badges, filename search, resizable panel.
-- **1C metadata tree** — a «Файлы | Метаданные» switch rebuilds the tree as a 1C:Enterprise metadata tree with per-type icons: Подсистемы, Справочники, Документы, Регистры, Общие модули, … → объекты → Реквизиты / Табличные части / Формы / Команды / Макеты / Модули. Click a module and it opens in the editor.
-- Monaco editor (CDN, no build step) with BSL syntax highlighting and per-extension language detection.
-- **F12 go-to-definition without LSP** — resolves «[Коллектор.]Модуль.Метод» through the metadata model (exact module); a bare method name is looked up in the current module only (repeated F12 cycles through candidates).
-- LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — **off by default** (unstable on large configurations). Enable it in DSH Settings → «1С-редактор»; status bar on top shows the connection state (click retries).
-- No code-server, no Docker.
+Открой любую выгрузку конфигурации 1С (ЗУП, ERP, БСП — даже огромные) во вкладке чата DSH: дерево метаданных, редактор Monaco с правильной раскраской BSL, переход к определениям и отправка кода в чат одной кнопкой.
 
-## Metadata tree: supported dump formats
+## Киллер-фичи
 
-The metadata tree auto-detects the configuration inside the workspace (scan depth 3, shallowest wins):
+### 🌲 Дерево метаданных 1С
+Левая панель переключается между обычным **деревом файлов** и настоящим **деревом метаданных 1С:Предприятия** с иконками типов — Подсистемы, Справочники, Документы, Регистры, Общие модули, … → объекты → Реквизиты / Табличные части / Формы / Команды / Макеты / Модули. Клик по модулю — и он открывается в редакторе. Поиск по имени объекта, клик по результату — и вы в нужном модуле.
 
-| Format | Marker | Notes |
-|---|---|---|
-| **EDT** | `Configuration/Configuration.mdo` | objects from `.mdo` files (attributes, tabular sections, forms, commands, templates) |
-| **XML dump (Designer)** | `ConfigDumpInfo.xml` + `Configuration.xml` | full tree from the flat/hierarchical metadata list, incl. attributes |
-| **Object-by-object XML** | root `Configuration.xml` + type dirs (`Catalogs/`, `Documents/`, …) | sections recovered from the filesystem: Формы / Команды / Макеты / Модули / Предопределённые (this dump variant stores no attribute metadata) |
+Три формата выгрузки определяются автоматически: **EDT** (`.mdo`), **XML-выгрузка из Конфигуратора** (`ConfigDumpInfo.xml`) и **пообъектная XML-выгрузка**. Дерево ленивое — парсится только то, что раскрываешь, поэтому конфигурации масштаба ЗУП остаются мгновенными.
 
-Module mapping: `CommonModules/<Имя>/Ext/Module.bsl`, `Catalogs/<Имя>/Ext/ObjectModule.bsl`, `Forms/<Форма>/Ext/Form/Module.bsl`, root `Ext/ManagedApplicationModule.bsl`, etc. — wherever the file exists on disk, the tree node opens it.
+### 🎨 Настоящая раскраска BSL
+Редактор использует **официальную TextMate-грамматику 1С** (ту же, что в VS Code-расширении `1c-syntax`) через monaco-textmate + onigasm. Грамматика вшита в плагин — раскраска не зависит от CDN в рантайме. Ключевые слова, строки, комментарии, `&Аннотации`, `#Область` — всё цветное. Сам Monaco грузится с CDN-цепочкой с запасными вариантами (jsdelivr → unpkg → cdnjs).
 
-The tree is lazy: only what you expand gets parsed, so ЗУП-scale configurations stay instant. Node icons come from the bundled `resources/icons/*.svg`.
+### ⚡ Переход к определению без LSP (F12)
+Статическая навигация через модель метаданных — тяжёлый language server не нужен:
+- `ОбщийМодуль.Метод()` / `Справочники.Товары.Метод()` → **точный модуль** и позиция (миллисекунды, даже на ЗУП);
+- имя метода без точки → поиск только в текущем модуле;
+- повторный F12 циклически перебирает несколько кандидатов.
 
-## Install
+### 💬 Отправка кода в чат
+Выдели фрагмент в редакторе → правый клик → **«Добавить к обсуждению»** → код попадает в композер DSH, готовый к вопросу модели.
+
+### 🔵 Индикаторы изменений git
+Бейджи `M` / `A` / `D` у файлов в дереве плюс маркеры на изменённых строках прямо в редакторе — всегда видно, что поменялось в рабочей копии.
+
+### 🔌 Опциональный LSP (выключен по умолчанию)
+Поддержка `bsl-language-server` (диагностика, автодополнение, hover, форматирование) через WebSocket — **по умолчанию выключена, и плагин её никогда не скачивает**: включите явно в Settings DSH → «1С-редактор», если у вас установлен `bsl-language-server.exe`. Учтите: на очень больших конфигурациях (ЗУП КОРП) сервер может зависнуть при построении модели конфигурации — статическая навигация выше работает в любом случае.
+
+### ⚙️ Настройки в штатных Settings DSH
+Отдельный раздел **«1С-редактор»** в настройках DSH (рядом с General / Models / Side card): переключатель LSP, порт, путь к бинарнику — применяется на лету, без рестарта.
+
+## Скриншоты
+
+<!-- Добавьте скриншоты: дерево метаданных + редактор (тёмная тема), навигация F12, раздел настроек -->
+
+## Установка
 
 ```sh
 dsh plugin --profile web add dsh-bsl-editor
 ```
 
-The plugin reads the workspace root from DSH's workspace registry — no manual path.
-For LSP it expects `bsl-language-server.exe` at
-`%LOCALAPPDATA%\Programs\bsl-language-server\bsl-language-server\bsl-language-server.exe`
-(the `bsl-language-server_win.zip` release layout).
+Или из локального архива:
 
-## Configuration
+```sh
+npm pack
+dsh plugin --profile web add --store-dir="<ваш pnpm store>" dsh-bsl-editor-0.1.0.tgz
+```
 
-| Key | Default | Meaning |
+Затем перезапустите `dsh web` (host-часть) и обновите вкладку браузера (Ctrl+Shift+R).
+
+> **Плагин никогда не скачивает `bsl-language-server`.** LSP выключен по умолчанию и запускается только после включения в настройках — и только если бинарник найден по адресу
+> `%LOCALAPPDATA%\Programs\bsl-language-server\bsl-language-server\bsl-language-server.exe`
+> (или по пути, указанному вами в настройках).
+
+## Требования
+
+- DeepSeek Harness (`dsh web`), любая актуальная версия
+- Node.js ≥ 20
+- Windows (редактор работает везде, где работает Monaco; сам плагин платформенно-независим)
+
+## Конфигурация
+
+| Ключ | По умолчанию | Значение |
 |---|---|---|
-| `serverPort` | `8025` | bsl-language-server WebSocket port |
-| `serverBin` | `""` | explicit path; empty = the standard install location |
-| `workspaceDir` | `""` | workspace root override; empty = the DSH workspace |
-| `sourceExtensions` | `[".bsl", ".os"]` | text sources opened as code |
-| `lspEnabled` | `false` | master LSP switch (Settings → «1С-редактор») |
+| `lspEnabled` | `false` | мастер-переключатель LSP (Settings → «1С-редактор») |
+| `serverPort` | `8025` | порт WebSocket bsl-language-server |
+| `serverBin` | `""` | явный путь к бинарнику; пусто = стандартное место установки |
+| `workspaceDir` | `""` | переопределение корня workspace; пусто = workspace DSH |
+| `sourceExtensions` | `[".bsl", ".os"]` | текстовые исходники, открываемые как код |
 
-## Structure
+## Поддерживаемые форматы выгрузки
 
-- `lib/index.js` — host half (ESM): `/bsl/*` routes (tree, read, search, git, meta), bsl-language-server spawn on demand.
-- `lib/metadata.js` — the 1C metadata model: format detection + three parsers (EDT / ConfigDumpInfo / object-by-object), lazy with caching.
-- `lib/client.js` — client half: the `Editor` conversation-view tab (tree + Monaco, files/metadata switch).
-- `resources/icons/` — 1C metadata node icons.
-- `cordis.patch.yml` — bundle patch mounting the plugin row.
+| Формат | Признак | Примечания |
+|---|---|---|
+| **EDT** | `Configuration/Configuration.mdo` | объекты из файлов `.mdo` (реквизиты, табличные части, формы, команды, макеты) |
+| **XML-выгрузка (Конфигуратор)** | `ConfigDumpInfo.xml` + `Configuration.xml` | полное дерево из плоского/иерархического списка метаданных |
+| **Пообъектная XML-выгрузка** | корневой `Configuration.xml` + папки типов (`Catalogs/`, `Documents/`, …) | разделы восстанавливаются из файловой системы: Формы / Команды / Макеты / Модули / Предопределённые |
 
-## Credits
+Сопоставление модулей: `CommonModules/<Имя>/Ext/Module.bsl`, `Catalogs/<Имя>/Ext/ObjectModule.bsl`, `Forms/<Форма>/Ext/Form/Module.bsl`, корневой `Ext/ManagedApplicationModule.bsl` и т.д. — где бы файл ни лежал на диске, узел дерева открывает его.
 
-Metadata tree structure and node icons are adapted from
+## Структура репозитория
+
+- `lib/index.js` — host-часть (ESM): маршруты `/bsl/*` (tree, read, search, git, meta, find-symbol), запуск bsl-language-server по требованию.
+- `lib/metadata.js` — модель метаданных 1С: определение формата + три парсера, ленивая загрузка с кешированием, статическое разрешение символов.
+- `lib/client.js` — клиентская часть: вкладка «Редактор» в conversation-view (дерево + Monaco, переключатель «Файлы | Метаданные»).
+- `resources/` — иконки узлов метаданных + официальные TextMate-грамматики 1С.
+- `tests/` — HTTP и LSP smoke-тесты (запускаются против живого `dsh web`).
+
+## Благодарности
+
+Структура дерева метаданных и иконки узлов адаптированы из
 [zerobig/vscode-1c-metadata-viewer](https://github.com/zerobig/vscode-1c-metadata-viewer)
-(MIT License, © Ilya Bushin). The object-by-object dump format support (no
-`ConfigDumpInfo.xml`) is original work beyond that extension.
+(MIT License, © Ilya Bushin). Поддержка пообъектного формата выгрузки (без
+`ConfigDumpInfo.xml`) — оригинальная работа сверх того расширения.
+
+## Лицензия
+
+[MIT](LICENSE)

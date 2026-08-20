@@ -1,7 +1,18 @@
 {
   "name": "dsh-bsl-editor",
   "version": "0.1.0",
-  "description": "DeepSeek Harness plugin: a 1C:Enterprise (BSL) code editor with file tree, git-change indicators, and full LSP (diagnostics, completion, hover, go-to-definition, formatting) backed by bsl-language-server over WebSocket.",
+  "description": "1C:Enterprise (BSL) code editor for DeepSeek Harness: metadata tree of the configuration, Monaco with the official BSL TextMate grammar, static go-to-definition, git change indicators, optional LSP.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "1c",
+    "1c-enterprise",
+    "bsl",
+    "editor",
+    "monaco",
+    "metadata"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -14,7 +25,8 @@
     "lib",
     "resources",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
