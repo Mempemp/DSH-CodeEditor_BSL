@@ -269,6 +269,15 @@ window.__ModuleLoader__.load({
       const [highlightPath, setHighlightPath] = useState(null);
       const [treeWidth, setTreeWidth] = useState(280);
 
+      // Metadata-tree mode: "files" (fs tree) | "meta" (1C metadata tree).
+      const [mode, setMode] = useState("files");
+      const [metaChildren, setMetaChildren] = useState(new Map()); // nodeKey -> items[]
+      const [metaExpanded, setMetaExpanded] = useState(new Set()); // expanded nodeKeys
+      const [metaInfo, setMetaInfo] = useState(null); // /bsl/meta/status result
+      const [metaError, setMetaError] = useState("");
+      const [metaLoading, setMetaLoading] = useState(false);
+      const [metaHighlight, setMetaHighlight] = useState(null);
+
       const joinPath = (parent, name) => parent + (parent.endsWith("/") || parent.endsWith("\\") ? "" : "\\") + name;
 
       const editorRef = useRef(null);
@@ -556,21 +565,22 @@ window.__ModuleLoader__.load({
 
       useEffect(() => { loadDir(""); refreshGit(); }, [loadDir, refreshGit]);
 
-      // Debounced file-name search (backed by the host's /bsl/search route).
+      // Debounced search (files: /bsl/search, metadata: /bsl/meta/search).
       useEffect(() => {
         const q = search.trim();
         if (!q) { setSearchResults([]); return; }
         let alive = true;
         const t = setTimeout(async () => {
           try {
-            const data = await fetchJson("/bsl/search?q=" + encodeURIComponent(q));
+            const url = mode === "meta" ? "/bsl/meta/search?q=" : "/bsl/search?q=";
+            const data = await fetchJson(url + encodeURIComponent(q));
             if (alive) setSearchResults(data.results || []);
           } catch {
             if (alive) setSearchResults([]);
           }
         }, 120);
         return () => { alive = false; clearTimeout(t); };
-      }, [search]);
+      }, [search, mode]);
 
       // Reveal a path in the tree: clear the search, load + expand every
       // directory from the root down to the target (inclusive), highlight it,
@@ -595,6 +605,70 @@ window.__ModuleLoader__.load({
         setHighlightPath(fullPath);
       }, [rootPath, expanded, children, loadDir]);
 
+      // ── Metadata tree (1C): lazy load + expand/collapse ────────────────
+      const loadMeta = useCallback(async (key) => {
+        setMetaLoading(true);
+        try {
+          const data = await fetchJson("/bsl/meta/list?p=" + encodeURIComponent(key || ""));
+          if (!data.ok) throw new Error(data.error || "meta error");
+          setMetaChildren((prev) => { const m = new Map(prev); m.set(key || "", data.items || []); return m; });
+          setMetaError("");
+          return data;
+        } catch (e) {
+          setMetaError(e?.message || String(e));
+          return null;
+        } finally {
+          setMetaLoading(false);
+        }
+      }, []);
+
+      const metaToggle = useCallback(async (key) => {
+        if (metaExpanded.has(key)) {
+          setMetaExpanded((prev) => { const s = new Set(prev); s.delete(key); return s; });
+        } else {
+          setMetaExpanded((prev) => new Set(prev).add(key));
+          if (!metaChildren.has(key)) await loadMeta(key);
+        }
+      }, [metaExpanded, metaChildren, loadMeta]);
+
+      // On first switch to metadata mode: fetch status and the root group list.
+      useEffect(() => {
+        if (mode !== "meta" || metaInfo) return;
+        let alive = true;
+        (async () => {
+          try {
+            const st = await fetchJson("/bsl/meta/status");
+            if (!alive) return;
+            setMetaInfo(st);
+            if (st.ok) {
+              if (!metaChildren.has("")) await loadMeta("");
+            }
+          } catch (e) {
+            if (alive) setMetaInfo({ ok: false, error: String(e) });
+          }
+        })();
+        return () => { alive = false; };
+      }, [mode, metaInfo, metaChildren, loadMeta]);
+
+      // Reveal a metadata node: expand every ancestor segment, then highlight.
+      const revealMeta = useCallback(async (key) => {
+        setSearch("");
+        const segs = String(key || "").split("/").filter(Boolean);
+        const newExpanded = new Set(metaExpanded);
+        const loaded = new Set(metaChildren.keys());
+        let acc = "";
+        for (const seg of segs) {
+          acc = acc ? acc + "/" + seg : seg;
+          if (!loaded.has(acc)) await loadMeta(acc);
+          loaded.add(acc);
+          newExpanded.add(acc);
+        }
+        setMetaExpanded(newExpanded);
+        setMetaHighlight(key);
+      }, [metaExpanded, metaChildren, loadMeta]);
+
+      const META_FORMAT_LABEL = { edt: "EDT", xml: "XML-выгрузка", object: "пообъектная выгрузка" };
+
       // Scroll the highlighted row into view once it renders (after expand).
       useEffect(() => {
         if (!highlightPath) return;
@@ -607,6 +681,19 @@ window.__ModuleLoader__.load({
           }
         }
       }, [highlightPath, expanded, children, search]);
+
+      // Same for metadata-mode highlight.
+      useEffect(() => {
+        if (!metaHighlight) return;
+        const list = treeBodyRef.current?.querySelectorAll("[data-meta-path]");
+        if (!list) return;
+        for (const el of list) {
+          if (el.dataset.metaPath === metaHighlight) {
+            el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+            break;
+          }
+        }
+      }, [metaHighlight, metaExpanded, metaChildren, search]);
 
       // Drag the divider between tree and editor to resize the tree.
       const startDrag = useCallback((e) => {
@@ -632,7 +719,7 @@ window.__ModuleLoader__.load({
       }, []);
 
       const gitBadge = (fullPath, type) => {
-        if (type !== "file") return null;
+        if (!fullPath || type !== "file") return null;
         let rel = fullPath.replace(/\\/g, "/");
         if (rootPath) {
           const r = rootPath.replace(/\\/g, "/");
@@ -694,6 +781,25 @@ window.__ModuleLoader__.load({
         if (!searchResults.length) {
           return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6 }, children: "Ничего не найдено" });
         }
+        if (mode === "meta") {
+          // Metadata search results: { key, label, icon } → reveal in tree.
+          return searchResults.map((r) => jsxs("div", {
+            key: r.key ?? r.label,
+            className: "dsh-bsl-row",
+            onClick: () => (r.file ? openFile(r.file) : revealMeta(r.key)),
+            style: {
+              boxSizing: "border-box", width: "100%", maxWidth: "100%", height: 34,
+              font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
+              textAlign: "left", cursor: "pointer", whiteSpace: "nowrap",
+              borderRadius: 8, alignItems: "center", gap: 6, padding: "0 8px",
+              display: "flex",
+            },
+            children: [
+              iconBox(metaIcon(r.icon)),
+              jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: r.label }),
+              jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap" }, children: r.key }),            ],
+          }));
+        }
         return searchResults.map((r) => {
           const isDir = r.type === "directory";
           return jsxs("div", {
@@ -718,13 +824,120 @@ window.__ModuleLoader__.load({
         });
       };
 
+      // 1C metadata icons come from the host's /bsl/icons route (dark set).
+      const metaIcon = (name) => jsx("img", {
+        src: "/bsl/icons/" + (name || "common") + ".svg",
+        width: 16, height: 16,
+        style: { flexShrink: 0, display: "block" },
+        alt: "",
+        onError: (e) => { e.currentTarget.style.visibility = "hidden"; },
+      });
+
+      const metaRowStyle = (active) => ({
+        boxSizing: "border-box",
+        width: "100%",
+        maxWidth: "100%",
+        height: 34,
+        font: "var(--dsw-font-s-14)",
+        color: "var(--dsw-alias-label-primary)",
+        textAlign: "left",
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+        borderRadius: 8,
+        alignItems: "center",
+        gap: 6,
+        padding: "0 8px",
+        display: "flex",
+        background: active ? "var(--dsw-alias-interactive-bg-hover)" : undefined,
+        boxShadow: active ? "inset 2px 0 0 var(--dsw-alias-state-business-primary)" : undefined,
+      });
+
+      const renderMetaRows = (items, depth) => (items || []).map((item) => {
+        const full = item.key;
+        const isOpen = full != null && metaExpanded.has(full);
+        const isActive = metaHighlight != null && full === metaHighlight;
+        const onClick = item.file
+          ? () => openFile(item.file)
+          : full
+          ? () => metaToggle(full)
+          : undefined;
+        const sub = isOpen
+          ? metaChildren.has(full)
+            ? renderMetaLevel(full, depth + 1)
+            : item.items && item.items.length
+            ? renderMetaRows(item.items, depth + 1)
+            : null
+          : null;
+        return jsxs(React.Fragment, {
+          key: full ?? item.label + ":" + (item.file || ""),
+          children: [
+            jsx("div", {
+              className: "dsh-bsl-row",
+              "data-meta-path": full ?? "",
+              onClick,
+              style: {
+                ...metaRowStyle(isActive),
+                paddingLeft: depth * 22 + 6,
+              },
+              children: [
+                iconBox(metaIcon(item.icon)),
+                jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: item.label }),
+                item.count ? jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5 }, children: item.count }) : null,
+                gitBadge(item.file, "file"),
+              ],
+            }),
+            sub,
+          ],
+        });
+      });
+
+      const renderMetaLevel = (key, depth) => renderMetaRows(metaChildren.get(key) || [], depth);
+
+      const renderMetaTree = () => {
+        if (metaInfo && !metaInfo.ok) {
+          return jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Метаданные: " + (metaInfo.error || "не найдены") });
+        }
+        if (metaError) {
+          return jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + metaError });
+        }
+        if (metaLoading && !metaChildren.has("")) {
+          return jsx("div", { style: { padding: "4px 10px", fontSize: 12, opacity: 0.6 }, children: "Загрузка метаданных…" });
+        }
+        if (!metaChildren.has("")) return null;
+        return renderMetaLevel("", 0);
+      };
+
       return jsxs("div", { ref: rootRef, "data-conversation-composer-overlay": "", style: { display: "flex", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
         jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [
           jsxs("div", { style: { padding: "2px 6px 6px", flexShrink: 0 }, children: [
-            jsx("div", { style: { padding: "0 4px 6px", fontSize: 12, opacity: 0.7 }, children: rootTitle || "Проект" }),
+            jsx("div", { style: { padding: "0 4px 6px", fontSize: 12, opacity: 0.7 }, children: mode === "meta"
+              ? (metaInfo?.ok ? (metaInfo.configName || "Конфигурация") + " · " + (META_FORMAT_LABEL[metaInfo.format] || metaInfo.format) : "Метаданные 1С")
+              : (rootTitle || "Проект") }),
+            jsxs("div", { style: { display: "flex", gap: 4, padding: "0 4px 8px" }, children: [
+              jsx("button", {
+                onClick: () => setMode("files"),
+                style: {
+                  flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
+                  font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
+                  background: mode === "files" ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
+                  opacity: mode === "files" ? 1 : 0.6,
+                },
+                children: "Файлы",
+              }),
+              jsx("button", {
+                onClick: () => setMode("meta"),
+                style: {
+                  flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
+                  font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
+                  background: mode === "meta" ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
+                  opacity: mode === "meta" ? 1 : 0.6,
+                },
+                children: "Метаданные",
+              }),
+            ]}),
             jsx("input", {
               type: "text",
-              placeholder: "Поиск по имени файла…",
+              placeholder: mode === "meta" ? "Поиск по метаданным…" : "Поиск по имени файла…",
               value: search,
               onChange: (e) => setSearch(e.target.value),
               style: {
@@ -737,6 +950,8 @@ window.__ModuleLoader__.load({
           ]}),
           jsx("div", { ref: treeBodyRef, style: { flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "0 6px 8px", paddingBottom: "calc(var(--dsh-composer-height, 152px) + 16px)" }, children: search.trim()
             ? renderSearchResults()
+            : mode === "meta"
+            ? renderMetaTree()
             : jsxs(React.Fragment, { children: [
                 jsx("div", { style: { padding: "0 10px 4px", fontSize: 11, color: "#8a8a8a" }, children: "LSP: выключен" }),
                 treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + treeError }) : null,

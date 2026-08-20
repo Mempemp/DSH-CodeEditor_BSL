@@ -12,7 +12,9 @@ import { appendFileSync, existsSync, mkdirSync, openSync, promises as fs, readFi
 import net from "node:net";
 import { homedir } from "node:os";
 import { join, relative, normalize, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import z from "schemastery";
+import { MetaModel, META_ICON_NAMES } from "./metadata.js";
 
 export const name = "dsh-bsl-editor";
 
@@ -296,6 +298,91 @@ async function handleGitDiff(root, url, res) {
   json(res, 200, { ok: true, path: rel, diff: (cached.ok ? cached.output : "") + (work.ok ? work.output : "") });
 }
 
+// --- 1C metadata tree (see metadata.js) ------------------------------------
+
+// The plugin may be loaded from a bundled location; resolve the icons dir by
+// walking up from this module until resources/icons is found.
+let iconDir = null;
+function resolveIconDir() {
+  if (iconDir) return iconDir;
+  let dir = fileURLToPath(new URL(".", import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    const candidate = join(dir, "resources", "icons");
+    if (existsSync(candidate)) {
+      iconDir = candidate;
+      return iconDir;
+    }
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function svgIconFile(name) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return null;
+  const dir = resolveIconDir();
+  if (!dir) return null;
+  const p = join(dir, name + ".svg");
+  return existsSync(p) ? p : null;
+}
+
+let metaModel = null;
+function getMetaModel(root) {
+  // Keyed by root: a workspace switch re-creates the model instead of
+  // serving stale metadata for the previous project.
+  if (!metaModel || metaModel.root !== root) metaModel = new MetaModel(root);
+  return metaModel;
+}
+
+async function handleMetaStatus(root, _url, res) {
+  try {
+    const m = getMetaModel(root);
+    await m.init();
+    json(res, 200, {
+      ok: true,
+      format: m.format,
+      configRoot: m.configRoot,
+      configName: m.configRoot.split(/[\\/]/).pop() || "",
+      groups: (m.groupsCache ?? []).length,
+    });
+  } catch (e) {
+    json(res, 200, { ok: false, error: e.message });
+  }
+}
+
+async function handleMetaList(root, url, res) {
+  try {
+    const m = getMetaModel(root);
+    await m.init();
+    const { items } = await m.list(url.searchParams.get("p") || "");
+    json(res, 200, { ok: true, format: m.format, items });
+  } catch (e) {
+    json(res, 400, { error: e.message });
+  }
+}
+
+async function handleMetaSearch(root, url, res) {
+  try {
+    const m = getMetaModel(root);
+    const results = await m.search(url.searchParams.get("q") || "");
+    json(res, 200, { ok: true, results });
+  } catch (e) {
+    json(res, 400, { error: e.message });
+  }
+}
+
+function handleIcon(_root, url, res) {
+  const name = (url.pathname || "").split("/").pop().replace(/\.svg$/i, "");
+  const p = svgIconFile(name);
+  if (!p) return json(res, 404, { error: "icon not found" });
+  res.writeHead(200, {
+    "content-type": "image/svg+xml",
+    "cache-control": "public, max-age=86400",
+  });
+  res.end(readFileSync(p));
+}
+
 export function apply(ctx, config) {
   // The user's project comes from the DSH workspace registry; fall back to dsh
   // cwd only when there is no workspace (never dsh's install dir by accident).
@@ -362,6 +449,22 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-diff",
     handler: (req, res) => handleGitDiff(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/meta/status",
+    handler: (req, res) => handleMetaStatus(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/meta/list",
+    handler: (req, res) => handleMetaList(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/meta/search",
+    handler: (req, res) => handleMetaSearch(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/icons",
+    handler: (req, res) => handleIcon(root, new URL(req.url, "http://x"), res),
   });
 
   // Adopt an already-running server on boot.
