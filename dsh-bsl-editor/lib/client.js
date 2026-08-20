@@ -82,7 +82,13 @@ window.__ModuleLoader__.load({
       showToast(inserted ? "Ссылка вставлена в чат" : "Ссылка скопирована — вставьте в чат (Ctrl+V)");
     }
 
-    const MONACO_BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs";
+    // Monaco CDNs tried in order — jsdelivr is blocked/throttled on some
+    // networks, unpkg and cdnjs are the fallbacks.
+    const MONACO_CDNS = [
+      "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs",
+      "https://unpkg.com/monaco-editor@0.52.2/min/vs",
+      "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs",
+    ];
     const LSP_PATH = "/lsp";
 
     // Map a file path to a Monaco language id (for syntax highlighting without LSP).
@@ -107,22 +113,161 @@ window.__ModuleLoader__.load({
       return res.json();
     }
 
-    // ── Monaco (CDN) ──────────────────────────────────────────────────────
+    // ── Monaco (CDN, with fallbacks) ──────────────────────────────────────
+    // Some hosts (a sibling plugin bundle, an embedded webview, a bundler
+    // polyfill) define globals that make monaco's AMD loader misdetect its
+    // environment. The killer is `module`: monaco's env check is
+    // `isNode = typeof module !== "undefined" && !!module.exports` — a page
+    // with a global `module` object makes it take `module.exports = …`,
+    // never installing its own `require` (window.require stays undefined and
+    // `.config` crashes). A global `define` with `.amd` has a similar effect
+    // (skips creating its loader). Neutralize them while the loader boots.
     let monacoPromise = null;
     function ensureMonaco() {
       if (monacoPromise) return monacoPromise;
-      monacoPromise = new Promise((resolve, reject) => {
-        if (window.monaco) return resolve(window.monaco);
-        const loader = document.createElement("script");
-        loader.src = MONACO_BASE + "/loader.js";
-        loader.onload = () => {
-          window.require.config({ paths: { vs: MONACO_BASE } });
-          window.require(["vs/editor/editor.main"], () => resolve(window.monaco), reject);
-        };
-        loader.onerror = () => reject(new Error("monaco CDN unreachable"));
-        document.head.appendChild(loader);
-      });
+      monacoPromise = (async () => {
+        if (window.monaco) return window.monaco;
+        let lastErr = null;
+        for (const base of MONACO_CDNS) {
+          const stashed = {};
+          let ok = false;
+          try {
+            for (const k of ["require", "define", "process", "module", "doNotInitLoader"]) {
+              if (k in window) {
+                stashed[k] = window[k];
+                try { delete window[k]; } catch { /* non-configurable */ }
+                // Globals declared with top-level `var` in injected scripts are
+                // non-configurable — delete silently fails. Overwrite instead
+                // (they are writable) so monaco's env detection sees nothing.
+                try { window[k] = undefined; } catch { /* non-writable — leave it */ }
+              }
+            }
+            await new Promise((resolve, reject) => {
+              const loader = document.createElement("script");
+              loader.src = base + "/loader.js";
+              loader.onload = () => resolve();
+              loader.onerror = () => reject(new Error("loader.js не загрузился (" + base + ")"));
+              document.head.appendChild(loader);
+            });
+            // Give back everything except require/define — monaco's own must
+            // stay installed until editor.main is done loading.
+            for (const k of Object.keys(stashed)) {
+              if (k !== "require" && k !== "define") window[k] = stashed[k];
+            }
+            if (typeof window.require !== "function") {
+              throw new Error(
+                "AMD require не установлен (" + base + ") — process=" + typeof window.process +
+                ", module=" + typeof window.module + ", define=" + typeof window.define,
+              );
+            }
+            const monaco = await new Promise((resolve, reject) => {
+              try {
+                window.require.config({ paths: { vs: base } });
+                window.require(
+                  ["vs/editor/editor.main"],
+                  () => resolve(window.monaco),
+                  (err) => reject(err instanceof Error ? err : new Error(String(err || "AMD load failed"))),
+                );
+              } catch (e) {
+                reject(e);
+              }
+            });
+            if (monaco) {
+              ok = true;
+              // Editor is fully loaded — but monaco's AMD `require`/`define`
+              // must STAY installed: the editor's worker bootstrap resolves
+              // modules through them at runtime. Hand back only the non-AMD
+              // globals (process/module/doNotInitLoader).
+              for (const k of Object.keys(stashed)) {
+                if (k !== "require" && k !== "define") window[k] = stashed[k];
+              }
+              return monaco;
+            }
+          } catch (e) {
+            lastErr = e;
+          } finally {
+            // Failure: hand every displaced global back before the next attempt.
+            if (!ok) {
+              for (const k of Object.keys(stashed)) window[k] = stashed[k];
+            }
+          }
+        }
+        throw lastErr || new Error("monaco CDN unreachable");
+      })();
       return monacoPromise;
+    }
+
+    // Official 1C TextMate grammar (the same one VS Code's 1C extension uses)
+    // via monaco-textmate@3 + onigasm. The grammar JSON itself is served
+    // same-origin by the host (/bsl/grammar/1c) — no runtime CDN dependency.
+    // On any failure the hand-written Monarch grammar stays as the fallback.
+    async function wireTmGrammar(monaco) {
+      try {
+        // monaco-textmate@3 uses onigasm INTERNALLY from a fixed jsdelivr URL
+        // — its WASM must be initialized through that exact module instance,
+        // so no CDN fallback for the module itself.
+        const onigasm = await import("https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm");
+        let wasm = null;
+        for (const u of [
+          "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/lib/onigasm.wasm",
+          "https://esm.sh/onigasm@2.2.2/lib/onigasm.wasm",
+        ]) {
+          try {
+            const r = await fetch(u);
+            if (r.ok) { wasm = await r.arrayBuffer(); break; }
+          } catch {}
+        }
+        if (!wasm) throw new Error("onigasm.wasm недоступен");
+        await onigasm.loadWASM(wasm);
+        let tm;
+        try {
+          tm = await import("https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm");
+        } catch {
+          tm = await import("https://esm.sh/monaco-textmate@3.0.1");
+        }
+        const [bslRes, queryRes] = await Promise.all([
+          fetch("/bsl/grammar/1c"),
+          fetch("/bsl/grammar/1c-query"),
+        ]);
+        if (!bslRes.ok) throw new Error("grammar HTTP " + bslRes.status);
+        const grammarJson = await bslRes.json();
+        const queryJson = queryRes.ok ? await queryRes.json() : null;
+        // The BSL grammar references the 1C-query grammar by its official
+        // scopeName ("source.sdbl" — a dependency for highlighting text-query
+        // strings), so the locator must serve it; plus a minimal fallback for
+        // any other unknown scope so the registry never hard-fails.
+        const defs = new Map([[grammarJson.scopeName, { format: "json", content: grammarJson }]]);
+        if (queryJson && queryJson.scopeName) defs.set(queryJson.scopeName, { format: "json", content: queryJson });
+        const registry = new tm.Registry({
+          getGrammarDefinition: async (scopeName) =>
+            defs.get(scopeName) || { format: "json", content: { scopeName, patterns: [], repository: {} } },
+        });
+        const grammar = await registry.loadGrammar(grammarJson.scopeName);
+        if (grammar) {
+          // Monaco 0.52 legacy provider shape: the tokenize result must carry
+          // {startIndex, scopes} tokens (most specific TM scope) and an
+          // endState that implements equals()/clone(); the adapter then matches
+          // scopes against the active theme (bsl-dark tokenColors).
+          class TokenizerState {
+            constructor(ruleStack) { this._ruleStack = ruleStack; }
+            get ruleStack() { return this._ruleStack; }
+            clone() { return new TokenizerState(this._ruleStack); }
+            equals(other) { return !!(other && other instanceof TokenizerState && other._ruleStack === this._ruleStack); }
+          }
+          monaco.languages.setTokensProvider("bsl", {
+            getInitialState: () => new TokenizerState(tm.INITIAL),
+            tokenize: (line, state) => {
+              const r = grammar.tokenizeLine(line, state.ruleStack);
+              return {
+                endState: new TokenizerState(r.ruleStack),
+                tokens: r.tokens.map((t) => ({ startIndex: t.startIndex, scopes: t.scopes[t.scopes.length - 1] })),
+              };
+            },
+          });
+        }
+      } catch (e) {
+        console.error("[dsh-bsl-editor] tm grammar", e);
+      }
     }
 
     function bslMonarch() {
@@ -186,6 +331,17 @@ window.__ModuleLoader__.load({
         return new Promise((resolve, reject) => {
           const ws = new WebSocket(this.url);
           this.ws = ws;
+          let settled = false;
+          const fail = (err) => {
+            if (settled) return;
+            settled = true;
+            // Reject every in-flight request too — otherwise a close during
+            // initialize/completion hangs the caller forever (infinite
+            // "LSP подключение…").
+            for (const p of this.pending.values()) p.reject(err);
+            this.pending.clear();
+            reject(err);
+          };
           ws.onopen = async () => {
             try {
               await this.request("initialize", {
@@ -203,14 +359,14 @@ window.__ModuleLoader__.load({
                 },
               });
               this.notify("initialized", {});
-              resolve();
+              if (!settled) { settled = true; resolve(); }
             } catch (e) {
-              reject(e);
+              fail(e);
             }
           };
-          ws.onerror = (e) => reject(new Error("ws error"));
+          ws.onerror = () => fail(new Error("ws error"));
           ws.onmessage = (ev) => this._handle(JSON.parse(ev.data));
-          ws.onclose = () => {};
+          ws.onclose = () => fail(new Error("ws closed"));
         });
       }
       _handle(msg) {
@@ -236,12 +392,20 @@ window.__ModuleLoader__.load({
       request(method, params) {
         const id = ++this.id;
         return new Promise((resolve, reject) => {
+          if (!this.ws || this.ws.readyState !== 1) {
+            reject(new Error("LSP соединение закрыто"));
+            return;
+          }
           this.pending.set(id, { resolve, reject });
           this.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
         });
       }
       notify(method, params) {
-        this.ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+        // Never throw on a dead socket — file opening must not depend on LSP.
+        if (!this.ws || this.ws.readyState !== 1) return;
+        try {
+          this.ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+        } catch {}
       }
     }
 
@@ -279,6 +443,11 @@ window.__ModuleLoader__.load({
       const [metaHighlight, setMetaHighlight] = useState(null);
       const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
       const [ctxMenu, setCtxMenu] = useState(null); // { x, y, item } — meta-tree context menu
+      const [lspReady, setLspReady] = useState(false); // LSP WebSocket connected
+      const [lspError, setLspError] = useState(""); // last LSP failure, shown in the status bar
+      const [lspAttempt, setLspAttempt] = useState(0); // bump to retry the LSP connection
+      const [monacoError, setMonacoError] = useState(""); // editor load failure, shown in the placeholder
+      const [cfg, setCfg] = useState(null); // /bsl/config result (plugin settings)
 
       const joinPath = (parent, name) => parent + (parent.endsWith("/") || parent.endsWith("\\") ? "" : "\\") + name;
 
@@ -286,6 +455,7 @@ window.__ModuleLoader__.load({
       const monacoRef = useRef(null);
       const modelRef = useRef(null);
       const lspRef = useRef(null);
+      const autoRetriesRef = useRef(0); // bounded auto-reconnect counter for LSP
       const containerRef = useRef(null);
       const decorationIdsRef = useRef([]);
       const rootRef = useRef(null);
@@ -313,6 +483,71 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, []);
 
+      // Plugin settings from the host (editable in DSH Settings → «1С-редактор»).
+      useEffect(() => {
+        let alive = true;
+        fetchJson("/bsl/config")
+          .then((c) => { if (alive) setCfg(c); })
+          .catch(() => {
+            if (alive) setCfg({ lspEnabled: true, serverPort: 8025, serverBin: "", sourceExtensions: [".bsl", ".os"], workspaceDir: "" });
+          });
+        return () => { alive = false; };
+      }, []);
+
+      // LSP: ensure bsl-language-server is running (the host spawns it on
+      // demand, JVM+Tomcat boot takes 2-10s) and connect the WebSocket client.
+      // The editor stays fully usable meanwhile — providers are wired in a
+      // separate effect once BOTH Monaco and LSP are ready. Bumping lspAttempt
+      // (status-bar click) or changing settings re-runs this whole sequence.
+      useEffect(() => {
+        // Master switch: LSP off — stand down and show nothing.
+        if (cfg && !cfg.lspEnabled) {
+          setLspReady(false);
+          setLspError("");
+          return;
+        }
+        let alive = true;
+        (async () => {
+          try {
+            const status0 = await fetchJson("/bsl/lsp-status");
+            const port = cfg?.serverPort || status0.port || 8025;
+            // lsp-start is idempotent: it probes the port and only spawns when
+            // the server is actually missing (a stale "running" state can't
+            // block a respawn). Always call it — it's the single source of truth.
+            const started = await fetchJson("/bsl/lsp-start");
+            if (!alive) return;
+            if (started.state !== "running") throw new Error(started.reason || "LSP server not running");
+            const wsInfo = await fetchJson("/bsl/workspaces");
+            const rootUri = "file:///" + (wsInfo.root || "").replace(/\\/g, "/");
+            const lsp = new LspClient(`ws://127.0.0.1:${port}${LSP_PATH}`, rootUri);
+            lspRef.current = lsp;
+            await lsp.connect();
+            if (!alive) { lsp.ws?.close(); return; }
+            autoRetriesRef.current = 0;
+            lsp.ws.onclose = () => {
+              if (!alive) return;
+              setLspReady(false);
+              // Auto-reconnect (bounded): the server may be restarted by a DSH
+              // reload or crash on a huge config — the editor should self-heal
+              // instead of waiting for a manual click.
+              if (autoRetriesRef.current < 3) {
+                autoRetriesRef.current += 1;
+                setLspError("");
+                setLspAttempt((n) => n + 1);
+              } else {
+                setLspError("LSP сервер отключился — нажмите для повтора");
+              }
+            };
+            setLspReady(true);
+            setLspError("");
+          } catch (e) {
+            console.error("[dsh-bsl-editor] lsp", e);
+            if (alive) setLspError(String(e?.message || e));
+          }
+        })();
+        return () => { alive = false; lspRef.current?.ws?.close(); lspRef.current = null; };
+      }, [lspAttempt, cfg]);
+
       // create the Monaco editor once
       useEffect(() => {
         let alive = true;
@@ -322,6 +557,33 @@ window.__ModuleLoader__.load({
           monaco.languages.register({ id: "bsl" });
           monaco.languages.setMonarchTokensProvider("bsl", bslMonarch());
           monaco.languages.setLanguageConfiguration("bsl", { comments: { lineComment: "//" } });
+          try {
+            monaco.editor.defineTheme("bsl-dark", {
+              base: "vs-dark",
+              inherit: true,
+              rules: [
+                { token: "keyword", foreground: "569CD6" },
+                { token: "keyword.operator", foreground: "D4D4D4" },
+                { token: "keyword.other.preprocessor", foreground: "C586C0" },
+                { token: "storage.type", foreground: "569CD6" },
+                { token: "storage.modifier", foreground: "C586C0" },
+                { token: "support.function", foreground: "DCDCAA" },
+                { token: "support.class", foreground: "4EC9B0" },
+                { token: "entity.name.function", foreground: "DCDCAA" },
+                { token: "entity.name.section", foreground: "DCDCAA" },
+                { token: "string.quoted.double", foreground: "CE9178" },
+                { token: "constant.numeric", foreground: "B5CEA8" },
+                { token: "constant.language", foreground: "569CD6" },
+                { token: "comment", foreground: "6A9955", fontStyle: "italic" },
+                { token: "variable", foreground: "9CDCFE" },
+                { token: "invalid", foreground: "F48771" },
+              ],
+              // monaco 0.52+ reads themeData.colors directly in the tokenTheme
+              // getter — the field must exist even when inheriting everything
+              // from the base theme (missing colors = crash on editor.create).
+              colors: {},
+            });
+          } catch {}
           const composerClearance = (() => {
             try {
               const v = getComputedStyle(document.documentElement).getPropertyValue("--dsh-composer-height").trim();
@@ -332,7 +594,7 @@ window.__ModuleLoader__.load({
           const editor = monaco.editor.create(containerRef.current, {
             value: "",
             language: "bsl",
-            theme: "vs-dark",
+            theme: "bsl-dark",
             automaticLayout: true,
             minimap: { enabled: true },
             fontSize: 14,
@@ -341,6 +603,9 @@ window.__ModuleLoader__.load({
           });
           editorRef.current = editor;
           if (alive) setMonacoReady(true);
+          // Official 1C TextMate grammar replaces the Monarch fallback once
+          // the TM stack is ready (best-effort, never blocks the editor).
+          wireTmGrammar(monaco);
 
           // Context-menu action: reference the current selection in the chat.
           editor.addAction({
@@ -363,107 +628,11 @@ window.__ModuleLoader__.load({
             },
           });
 
-          const disposables = [];
-
-          if (lspRef.current) {
-            lspRef.current.onDiagnostics = (uri, diags) => {
-              const model = editor.getModel();
-              const map = diags.map((d) => ({
-                severity: d.severity === 1 ? monaco.MarkerSeverity.Error : d.severity === 2 ? monaco.MarkerSeverity.Warning : d.severity === 3 ? monaco.MarkerSeverity.Info : monaco.MarkerSeverity.Hint,
-                message: d.message,
-                startLineNumber: d.range.start.line + 1,
-                startColumn: d.range.start.character + 1,
-                endLineNumber: d.range.end.line + 1,
-                endColumn: d.range.end.character + 1,
-              }));
-              monaco.editor.setModelMarkers(model, "bsl", map);
-            };
-
-            disposables.push(monaco.languages.registerCompletionItemProvider("bsl", {
-              triggerCharacters: [".", " "],
-              provideCompletionItems: async (model, position) => {
-                const uri = model.uri.toString();
-                const items = await lspRef.current.request("textDocument/completion", {
-                  textDocument: { uri },
-                  position: { line: position.lineNumber - 1, character: position.column - 1 },
-                });
-                if (!items) return { suggestions: [] };
-                const list = Array.isArray(items) ? items : items.items;
-                return {
-                  suggestions: (list || []).map((it) => ({
-                    label: it.label,
-                    kind: monaco.languages.CompletionItemKind.Text,
-                    detail: it.detail,
-                    documentation: it.documentation?.value ?? it.documentation,
-                    insertText: it.insertText ?? it.label,
-                  })),
-                };
-              },
-            }));
-
-            disposables.push(monaco.languages.registerHoverProvider("bsl", {
-              provideHover: async (model, position) => {
-                const uri = model.uri.toString();
-                const res = await lspRef.current.request("textDocument/hover", {
-                  textDocument: { uri },
-                  position: { line: position.lineNumber - 1, character: position.column - 1 },
-                });
-                if (!res) return null;
-                const value = res.contents?.value ?? (typeof res.contents === "string" ? res.contents : "");
-                return { contents: [{ value: String(value || "") }] };
-              },
-            }));
-
-            disposables.push(monaco.languages.registerDefinitionProvider("bsl", {
-              provideDefinition: async (model, position) => {
-                const uri = model.uri.toString();
-                const res = await lspRef.current.request("textDocument/definition", {
-                  textDocument: { uri },
-                  position: { line: position.lineNumber - 1, character: position.column - 1 },
-                });
-                if (!res) return null;
-                const loc = Array.isArray(res) ? res[0] : res;
-                if (!loc) return null;
-                return {
-                  uri: monaco.Uri.parse(loc.uri),
-                  range: new monaco.Range(loc.range.start.line + 1, loc.range.start.character + 1, loc.range.end.line + 1, loc.range.end.character + 1),
-                };
-              },
-            }));
-
-            disposables.push(monaco.languages.registerDocumentFormattingEditProvider("bsl", {
-              provideDocumentFormattingEdits: async (model) => {
-                const uri = model.uri.toString();
-                const edits = await lspRef.current.request("textDocument/formatting", {
-                  textDocument: { uri },
-                  options: { tabSize: 4, insertSpaces: true },
-                });
-                return (edits || []).map((e) => ({
-                  range: new monaco.Range(e.range.start.line + 1, e.range.start.character + 1, e.range.end.line + 1, e.range.end.character + 1),
-                  text: e.newText,
-                }));
-              },
-            }));
-
-            // didChange (full sync, debounced)
-            let changeTimer = null;
-            disposables.push(editor.onDidChangeModelContent(() => {
-              const model = editor.getModel();
-              const uri = model.uri.toString();
-              clearTimeout(changeTimer);
-              changeTimer = setTimeout(() => {
-                lspRef.current.notify("textDocument/didChange", {
-                  textDocument: { uri, version: model.getVersionId() },
-                  contentChanges: [{ text: model.getValue() }],
-                });
-                refreshGitDecorations();
-              }, 400);
-            }));
-          }
-
-          disposables.forEach(() => {});
           return () => { alive = false; editor.dispose(); };
-        }).catch((e) => console.error("[dsh-bsl-editor] monaco", e));
+        }).catch((e) => {
+          console.error("[dsh-bsl-editor] monaco", e);
+          if (alive) setMonacoError(String(e?.message || e));
+        });
         return () => { alive = false; };
       }, []);
 
@@ -565,6 +734,160 @@ window.__ModuleLoader__.load({
           decorationIdsRef.current = editorRef.current.deltaDecorations(old, decorations);
         } catch {}
       }, []);
+
+      // LSP feature wiring: once Monaco exists AND the LSP client is connected,
+      // register diagnostics/completion/hover/definition/formatting and sync
+      // edits. Runs when EITHER becomes ready — Monaco boots from CDN while the
+      // LSP server boots its JVM, so a single combined effect can't race.
+      useEffect(() => {
+        if (!monacoReady || !lspReady) return;
+        const monaco = monacoRef.current;
+        const editor = editorRef.current;
+        const lsp = lspRef.current;
+        if (!monaco || !editor || !lsp) return;
+
+        const disposables = [];
+
+        lsp.onDiagnostics = (uri, diags) => {
+          const model = monaco.editor.getModel(monaco.Uri.parse(uri));
+          if (!model) return;
+          const map = diags.map((d) => ({
+            severity: d.severity === 1 ? monaco.MarkerSeverity.Error : d.severity === 2 ? monaco.MarkerSeverity.Warning : d.severity === 3 ? monaco.MarkerSeverity.Info : monaco.MarkerSeverity.Hint,
+            message: d.message,
+            startLineNumber: d.range.start.line + 1,
+            startColumn: d.range.start.character + 1,
+            endLineNumber: d.range.end.line + 1,
+            endColumn: d.range.end.character + 1,
+          }));
+          monaco.editor.setModelMarkers(model, "bsl", map);
+        };
+
+        disposables.push(monaco.languages.registerCompletionItemProvider("bsl", {
+          triggerCharacters: [".", " "],
+          provideCompletionItems: async (model, position) => {
+            const uri = model.uri.toString();
+            const items = await lsp.request("textDocument/completion", {
+              textDocument: { uri },
+              position: { line: position.lineNumber - 1, character: position.column - 1 },
+            });
+            if (!items) return { suggestions: [] };
+            const list = Array.isArray(items) ? items : items.items;
+            return {
+              suggestions: (list || []).map((it) => ({
+                label: it.label,
+                kind: monaco.languages.CompletionItemKind.Text,
+                detail: it.detail,
+                documentation: it.documentation?.value ?? it.documentation,
+                insertText: it.insertText ?? it.label,
+              })),
+            };
+          },
+        }));
+
+        disposables.push(monaco.languages.registerHoverProvider("bsl", {
+          provideHover: async (model, position) => {
+            const uri = model.uri.toString();
+            const res = await lsp.request("textDocument/hover", {
+              textDocument: { uri },
+              position: { line: position.lineNumber - 1, character: position.column - 1 },
+            });
+            if (!res) return null;
+            const value = res.contents?.value ?? (typeof res.contents === "string" ? res.contents : "");
+            return { contents: [{ value: String(value || "") }] };
+          },
+        }));
+
+        disposables.push(monaco.languages.registerDefinitionProvider("bsl", {
+          provideDefinition: async (model, position) => {
+            const uri = model.uri.toString();
+            const res = await lsp.request("textDocument/definition", {
+              textDocument: { uri },
+              position: { line: position.lineNumber - 1, character: position.column - 1 },
+            });
+            if (!res) return null;
+            const loc = Array.isArray(res) ? res[0] : res;
+            if (!loc) return null;
+            return {
+              uri: monaco.Uri.parse(loc.uri),
+              range: new monaco.Range(loc.range.start.line + 1, loc.range.start.character + 1, loc.range.end.line + 1, loc.range.end.character + 1),
+            };
+          },
+        }));
+
+        // Shift+F12 — all usages, including cross-module ones (BSL LS advertises
+        // referencesProvider; the index needs the config to be loaded).
+        disposables.push(monaco.languages.registerReferenceProvider("bsl", {
+          provideReferences: async (model, position, context) => {
+            const uri = model.uri.toString();
+            const refs = await lsp.request("textDocument/references", {
+              textDocument: { uri },
+              position: { line: position.lineNumber - 1, character: position.column - 1 },
+              context: { includeDeclaration: !!context?.includeDeclaration },
+            });
+            return (refs || []).map((r) => ({
+              uri: monaco.Uri.parse(r.uri),
+              range: new monaco.Range(r.range.start.line + 1, r.range.start.character + 1, r.range.end.line + 1, r.range.end.character + 1),
+            }));
+          },
+        }));
+
+        disposables.push(monaco.languages.registerDocumentHighlightProvider("bsl", {
+          provideDocumentHighlights: async (model, position) => {
+            const uri = model.uri.toString();
+            const res = await lsp.request("textDocument/documentHighlight", {
+              textDocument: { uri },
+              position: { line: position.lineNumber - 1, character: position.column - 1 },
+            });
+            return (res || []).map((h) => ({
+              range: new monaco.Range(h.range.start.line + 1, h.range.start.character + 1, h.range.end.line + 1, h.range.end.character + 1),
+              kind: h.kind === 1 ? monaco.languages.DocumentHighlightKind.Text : h.kind === 2 ? monaco.languages.DocumentHighlightKind.Read : monaco.languages.DocumentHighlightKind.Write,
+            }));
+          },
+        }));
+
+        disposables.push(monaco.languages.registerDocumentFormattingEditProvider("bsl", {
+          provideDocumentFormattingEdits: async (model) => {
+            const uri = model.uri.toString();
+            const edits = await lsp.request("textDocument/formatting", {
+              textDocument: { uri },
+              options: { tabSize: 4, insertSpaces: true },
+            });
+            return (edits || []).map((e) => ({
+              range: new monaco.Range(e.range.start.line + 1, e.range.start.character + 1, e.range.end.line + 1, e.range.end.character + 1),
+              text: e.newText,
+            }));
+          },
+        }));
+
+        // didChange (full sync, debounced)
+        let changeTimer = null;
+        disposables.push(editor.onDidChangeModelContent(() => {
+          const model = editor.getModel();
+          const uri = model.uri.toString();
+          clearTimeout(changeTimer);
+          changeTimer = setTimeout(() => {
+            lsp.notify("textDocument/didChange", {
+              textDocument: { uri, version: model.getVersionId() },
+              contentChanges: [{ text: model.getValue() }],
+            });
+            refreshGitDecorations();
+          }, 400);
+        }));
+
+        // A file may already be open (opened before the LSP finished booting) —
+        // sync it to the server now.
+        const model = editor.getModel();
+        if (model && /^file:/.test(model.uri.toString())) {
+          lsp.notify("textDocument/didOpen", {
+            textDocument: { uri: model.uri.toString(), languageId: "bsl", version: 1, text: model.getValue() },
+          });
+        }
+
+        return () => {
+          clearTimeout(changeTimer);
+          disposables.forEach((d) => { if (d && typeof d.dispose === "function") d.dispose(); });
+        };
+      }, [monacoReady, lspReady]);
 
       useEffect(() => { loadDir(""); refreshGit(); }, [loadDir, refreshGit]);
 
@@ -953,8 +1276,33 @@ window.__ModuleLoader__.load({
         return renderMetaLevel("", 0);
       };
 
-      return jsxs("div", { ref: rootRef, "data-conversation-composer-overlay": "", style: { display: "flex", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
-        jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [
+      return jsxs("div", { ref: rootRef, "data-conversation-composer-overlay": "", style: { position: "relative", display: "flex", flexDirection: "column", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
+        // Status bar — top strip, in flow, visible in both files and metadata
+        // modes. Click retries a failed LSP connection; settings live in
+        // DSH Settings → «1С-редактор».
+        jsx("div", {
+          onClick: () => { if (!lspReady) setLspAttempt((n) => n + 1); },
+          title: lspReady ? "bsl-language-server подключён" : lspError ? "Нажмите, чтобы повторить подключение (настройки: Settings → 1С-редактор)" : "Запуск bsl-language-server…",
+          style: {
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            height: 24,
+            padding: "0 12px",
+            fontSize: 11,
+            color: cfg && !cfg.lspEnabled ? "#8a8a8a" : lspReady ? "#4caf50" : lspError ? "#f44336" : "#ffb300",
+            background: "var(--dsw-alias-bg-layer-2)",
+            borderBottom: "1px solid var(--dsw-alias-border-l2)",
+            cursor: lspReady ? "default" : "pointer",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          },
+          children: cfg && !cfg.lspEnabled ? "LSP выключен в настройках" : lspReady ? "● LSP готов" : lspError ? "✕ LSP: " + lspError + " — нажмите для повтора" : "○ LSP подключение…",
+        }),
+        jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
+          jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [
           jsxs("div", { style: { padding: "2px 6px 6px", flexShrink: 0 }, children: [
             jsx("div", { style: { padding: "0 4px 6px", fontSize: 12, opacity: 0.7 }, children: mode === "meta"
               ? (metaInfo?.ok ? (metaInfo.configName || "Конфигурация") + " · " + (META_FORMAT_LABEL[metaInfo.format] || metaInfo.format) : "Метаданные 1С")
@@ -999,7 +1347,6 @@ window.__ModuleLoader__.load({
             : mode === "meta"
             ? renderMetaTree()
             : jsxs(React.Fragment, { children: [
-                jsx("div", { style: { padding: "0 10px 4px", fontSize: 11, color: "#8a8a8a" }, children: "LSP: выключен" }),
                 treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + treeError }) : null,
                 !rootPath && !treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 12, opacity: 0.6 }, children: "Загрузка…" }) : null,
                 renderLevel(rootPath, 0),
@@ -1010,9 +1357,10 @@ window.__ModuleLoader__.load({
           className: "dsh-bsl-resizer",
           style: { width: 4, flexShrink: 0, cursor: "col-resize", minHeight: 0 },
         }),
-        jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
-          !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13 }, children: "Загрузка редактора…" }) : null,
+                jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
+          !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13, whiteSpace: "pre-wrap" }, children: monacoError ? "Ошибка загрузки редактора:\n" + monacoError : "Загрузка редактора…" }) : null,
           editorNotice ? jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, textAlign: "center", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-secondary, #8a94a6)", opacity: 0.8, pointerEvents: "none", whiteSpace: "pre-wrap" }, children: editorNotice }) : null,
+        ]}),
         ]}),
         ctxMenu ? jsxs(React.Fragment, { children: [
           jsx("div", { style: { position: "fixed", inset: 0, zIndex: 2147482900, background: "transparent" }, onMouseDown: () => setCtxMenu(null), onContextMenu: (e) => { e.preventDefault(); setCtxMenu(null); } }),
@@ -1060,12 +1408,72 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // Settings section shown in DSH Settings (nav item «1С-редактор») — the
+    // single config source is the host (/bsl/config, persisted on save).
+    function PluginSettingsSection() {
+      const [cfg, setCfg] = React.useState(null);
+      const [form, setForm] = React.useState({ lspEnabled: true, serverPort: 8025, serverBin: "" });
+      const [saved, setSaved] = React.useState(false);
+      React.useEffect(() => {
+        let alive = true;
+        fetchJson("/bsl/config").then((c) => { if (alive) setCfg(c); }).catch(() => {});
+        return () => { alive = false; };
+      }, []);
+      React.useEffect(() => {
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "" });
+      }, [cfg]);
+      const save = async () => {
+        try {
+          await fetchJson("/bsl/config-save", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin }),
+          });
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin }));
+          setSaved(true);
+          setTimeout(() => setSaved(false), 2000);
+        } catch (e) {
+          console.error("[dsh-bsl-editor] settings save", e);
+        }
+      };
+      const inputStyle = { boxSizing: "border-box", width: "100%", height: 28, padding: "0 8px", borderRadius: 6, border: "1px solid var(--dsw-alias-border-l2)", background: "var(--dsw-alias-bg-base)", color: "inherit", font: "var(--dsw-font-s-14)" };
+      return jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 12, maxWidth: 420 }, children: [
+        jsx("div", { style: { opacity: 0.7 }, children: "Плагин 1С-редактора: файловое дерево, метаданные, Monaco + bsl-language-server" }),
+        jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
+          jsx("input", { type: "checkbox", checked: form.lspEnabled, onChange: (e) => setForm((f) => ({ ...f, lspEnabled: e.target.checked })) }),
+          "LSP (диагностика, автодополнение, переходы)",
+        ]}),
+        jsxs("label", { style: { display: "block" }, children: [
+          jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Порт сервера" }),
+          jsx("input", { type: "number", value: form.serverPort, onChange: (e) => setForm((f) => ({ ...f, serverPort: Number(e.target.value) || 8025 })), style: inputStyle }),
+        ]}),
+        jsxs("label", { style: { display: "block" }, children: [
+          jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Путь к bsl-language-server.exe" }),
+          jsx("input", { type: "text", value: form.serverBin, onChange: (e) => setForm((f) => ({ ...f, serverBin: e.target.value })), placeholder: "(пусто = стандартное место установки)", style: inputStyle }),
+          jsx("div", { style: { marginTop: 3, opacity: 0.55, fontSize: 11, lineHeight: 1.4 }, children: "Укажите полный путь к exe, если сервер установлен не туда, где ожидается. Стандартное место после установки bsl-language-server_win.zip:" }),
+          jsx("code", { style: { display: "block", marginTop: 2, opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: "%LOCALAPPDATA%\\Programs\\bsl-language-server\\bsl-language-server\\bsl-language-server.exe" }),
+        ]}),
+        jsx("div", { style: { display: "flex", alignItems: "center", gap: 10 }, children: [
+          jsx("button", { onClick: save, style: { height: 28, padding: "0 16px", border: "none", borderRadius: 8, cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" }, children: "Сохранить" }),
+          saved ? jsx("span", { style: { color: "#4caf50", fontSize: 12 }, children: "Сохранено" }) : null,
+          jsx("span", { style: { opacity: 0.6, fontSize: 11 }, children: "Соединение LSP обновится при открытии вкладки редактора" }),
+        ]}),
+      ]});
+    }
+
     function apply(ctx) {
       ctx.slots.inject(
         "conversation.view",
         () => ctx.slots.register(
           { name: "conversation.view", id: "dsh-bsl-editor", order: 15, label: () => "Editor", registrant: "dsh-bsl-editor" },
           EditorBoundary,
+        ),
+      );
+      ctx.slots.inject(
+        "settings.section",
+        () => ctx.slots.register(
+          { name: "settings.section", id: "dsh-bsl-editor", order: 50, label: () => "1С-редактор", registrant: "dsh-bsl-editor" },
+          PluginSettingsSection,
         ),
       );
     }

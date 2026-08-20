@@ -27,6 +27,8 @@ export const Config = z.object({
   workspaceDir: z.string().default(""),
   /** File extensions treated as BSL/OS sources. */
   sourceExtensions: z.array(z.string()).default([".bsl", ".os"]),
+  /** Master switch: when false the client skips LSP entirely. */
+  lspEnabled: z.boolean().default(true),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -40,6 +42,18 @@ const DEFAULT_BIN = join(
 const LOG_DIR = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "dsh-bsl-editor");
 const LOG_FILE = join(LOG_DIR, "server.log");
 const CONFIG_FILE = join(LOG_DIR, "bsl-language-server.json");
+// User settings saved from the in-tab settings panel (override the defaults).
+const PLUGIN_CONFIG_FILE = join(LOG_DIR, "plugin-config.json");
+
+function loadPluginOverrides() {
+  try {
+    const raw = readFileSync(PLUGIN_CONFIG_FILE, "utf-8");
+    const o = JSON.parse(raw);
+    return typeof o === "object" && o !== null ? o : {};
+  } catch {
+    return {};
+  }
+}
 
 // Text file extensions the editor opens as text (everything else = [binary file]).
 const TEXT_EXTENSIONS = new Set([".bsl", ".os", ".md", ".markdown", ".txt", ".json", ".xml", ".yml", ".yaml", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".htm", ".css", ".scss", ".less", ".sh", ".bat", ".cmd", ".ps1", ".ini", ".toml", ".cfg", ".conf", ".csv", ".log", ".sql", ".gradle", ".kt", ".java", ".cs", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cpp", ".hpp", ".proto"]);
@@ -383,7 +397,39 @@ function handleIcon(_root, url, res) {
   res.end(readFileSync(p));
 }
 
+// Official 1C TextMate grammars are bundled under resources/grammar/ and
+// served same-origin — the editor's syntax highlighting never depends on a CDN.
+let grammarDir = null;
+function resolveGrammarDir() {
+  if (grammarDir) return grammarDir;
+  let dir = fileURLToPath(new URL(".", import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    const candidate = join(dir, "resources", "grammar");
+    if (existsSync(candidate)) {
+      grammarDir = candidate;
+      return grammarDir;
+    }
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function handleGrammar(_root, url, res) {
+  const name = (url.pathname || "").split("/").pop().replace(/\.json$/i, "");
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return json(res, 404, { error: "bad grammar name" });
+  const dir = resolveGrammarDir();
+  const p = dir ? join(dir, name + ".tmLanguage.json") : null;
+  if (!p || !existsSync(p)) return json(res, 404, { error: "grammar not found" });
+  res.writeHead(200, { "content-type": "application/json", "cache-control": "public, max-age=3600" });
+  res.end(readFileSync(p));
+}
+
 export function apply(ctx, config) {
+  // Settings saved from the in-tab panel win over the bundled defaults.
+  Object.assign(config, loadPluginOverrides());
+
   // The user's project comes from the DSH workspace registry; fall back to dsh
   // cwd only when there is no workspace (never dsh's install dir by accident).
   const workspaces = (() => {
@@ -405,14 +451,22 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/lsp-start",
     handler: async (_req, res) => {
-      if (state !== "running" && !(await probePort(config.serverPort))) startServer(config, root);
-      // Block until the server is actually ready (JVM + Tomcat boot takes 2-10s),
-      // so the client can connect right after instead of racing the boot.
-      const deadline = Date.now() + 30000;
-      while (state === "starting" && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 500));
+      // Trust the PORT, not the cached state: an adopted server may have died
+      // since boot, leaving a stale "running" that would otherwise block a
+      // respawn forever.
+      let up = await probePort(config.serverPort);
+      if (!up) {
+        startServer(config, root);
+        // Block until the server is actually ready (JVM + Tomcat boot takes
+        // 2-10s), so the client can connect right after instead of racing.
+        const deadline = Date.now() + 30000;
+        while (state === "starting" && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        up = await probePort(config.serverPort);
       }
-      json(res, 202, { ok: true, state });
+      if (up) setState("running");
+      json(res, 202, { ok: up, state: up ? "running" : state, reason: up ? "" : reason, port: config.serverPort });
     },
   });
   ctx.webServer.register({
@@ -429,6 +483,44 @@ export function apply(ctx, config) {
         json(res, 200, { ok: false, log: "(no log yet)" });
       }
     },
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/config",
+    handler: (_req, res) => json(res, 200, {
+      lspEnabled: config.lspEnabled,
+      serverPort: config.serverPort,
+      serverBin: config.serverBin,
+      workspaceDir: config.workspaceDir,
+      sourceExtensions: config.sourceExtensions,
+    }),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/config-save",
+    handler: (req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        try {
+          const patch = JSON.parse(body || "{}");
+          const next = {
+            lspEnabled: patch.lspEnabled ?? config.lspEnabled,
+            serverPort: patch.serverPort ?? config.serverPort,
+            serverBin: patch.serverBin ?? config.serverBin,
+            sourceExtensions: patch.sourceExtensions ?? config.sourceExtensions,
+          };
+          mkdirSync(LOG_DIR, { recursive: true });
+          writeFileSync(PLUGIN_CONFIG_FILE, JSON.stringify(next, null, 2) + "\n", "utf-8");
+          Object.assign(config, next);
+          json(res, 200, { ok: true, config: { ...next } });
+        } catch (e) {
+          json(res, 400, { ok: false, error: e.message });
+        }
+      });
+    },
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/grammar",
+    handler: (req, res) => handleGrammar(root, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/tree",

@@ -5,7 +5,7 @@ DeepSeek Harness plugin: a **1C:Enterprise (BSL) code editor** in one window.
 - File tree of the current DSH workspace — lazy-loading, git M/A/D badges, filename search, resizable panel.
 - **1C metadata tree** — a «Файлы | Метаданные» switch rebuilds the tree as a 1C:Enterprise metadata tree with per-type icons: Подсистемы, Справочники, Документы, Регистры, Общие модули, … → объекты → Реквизиты / Табличные части / Формы / Команды / Макеты / Модули. Click a module and it opens in the editor.
 - Monaco editor (CDN, no build step) with BSL syntax highlighting and per-extension language detection.
-- Optional LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — off by default.
+- LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — auto-starts when the Editor tab opens; status bar at the bottom shows the connection state (click retries a failed connection).
 - No code-server, no Docker.
 
 ## Metadata tree: supported dump formats
@@ -44,7 +44,7 @@ For LSP it expects `bsl-language-server.exe` at
 
 ## Structure
 
-- `lib/index.js` — host half (ESM): `/bsl/*` routes (tree, read, search, git, meta), optional bsl-language-server spawn.
+- `lib/index.js` — host half (ESM): `/bsl/*` routes (tree, read, search, git, meta), bsl-language-server spawn on demand.
 - `lib/metadata.js` — the 1C metadata model: format detection + three parsers (EDT / ConfigDumpInfo / object-by-object), lazy with caching.
 - `lib/client.js` — client half: the `Editor` conversation-view tab (tree + Monaco, files/metadata switch).
 - `resources/icons/` — 1C metadata node icons.
