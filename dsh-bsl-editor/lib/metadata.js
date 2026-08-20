@@ -808,12 +808,21 @@ export class MetaModel {
       let candidates = [];
       if (collDir && ref) candidates = this.moduleFilesForRef(ref, collDir);
       if (!candidates.length && ref) candidates = this.moduleFilesForRef(ref);
-      const targets = [];
-      for (const { file } of candidates) {
-        const hit = await this.findMethodInFile(file, method);
-        if (hit) targets.push(hit);
+      if (candidates.length) {
+        const targets = [];
+        for (const { file } of candidates) {
+          const hit = await this.findMethodInFile(file, method);
+          if (hit) targets.push(hit);
+        }
+        if (targets.length) return { targets, resolved: true };
       }
-      return { targets, resolved: true };
+      // ref не резолвится как модуль метаданных (переменная, ЭтотОбъект,
+      // этотФорма) — метод может быть объявлен в текущем модуле.
+      if (currentFile) {
+        const hit = await this.findMethodInFile(currentFile, method);
+        if (hit) return { targets: [hit], resolved: true };
+      }
+      return { targets: [], resolved: true };
     }
     if (currentFile) {
       const hit = await this.findMethodInFile(currentFile, method);

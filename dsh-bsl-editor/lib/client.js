@@ -474,8 +474,11 @@ window.__ModuleLoader__.load({
       const treeBodyRef = useRef(null);
       const draggingRef = useRef(false);
       const rootPathRef = useRef("");
+      const openPathRef = useRef("");
       const staticNavRef = useRef(null); // { word, targets, index } for F12 cycling
+      const f12BoundRef = useRef(null); // editor.addCommand id — bind F12 once
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
+      useEffect(() => { openPathRef.current = openPath; }, [openPath]);
 
       // Fetch the workspace title. LSP is intentionally deferred — the editor
       // works as a file browser + Monaco (syntax highlighting) on its own.
@@ -619,6 +622,12 @@ window.__ModuleLoader__.load({
           });
           editorRef.current = editor;
           if (alive) setMonacoReady(true);
+          // No file selected yet: detach the empty model and show a hint
+          // instead of a lonely first line.
+          if (!openPathRef.current) {
+            editor.setModel(null);
+            setEditorNotice("Выберите файл из дерева");
+          }
           // Official 1C TextMate grammar replaces the Monarch fallback once
           // the TM stack is ready (best-effort, never blocks the editor).
           wireTmGrammar(monaco);
@@ -911,45 +920,58 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!monacoReady || !monacoRef.current || !editorRef.current) return;
         const monaco = monacoRef.current;
-        const disp = monaco.languages.registerDefinitionProvider("bsl", {
-          provideDefinition: async (model, position) => {
-            if (lspRef.current) return null; // LSP provider handles it
-            try {
-              const word = wordAt(model, position);
-              if (!word) return null;
-              const prev = staticNavRef.current;
-              if (prev && prev.word === word && prev.targets.length) {
-                const idx = (prev.index + 1) % prev.targets.length;
-                prev.index = idx;
-                const t = prev.targets[idx];
-                await openFile(t.file);
-                const ed = editorRef.current;
-                if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
-                setEditorNotice(`«${word}» — ${idx + 1} из ${prev.targets.length}`);
-                return null;
-              }
-              const res = await fetchJson(
-                "/bsl/find-symbol?name=" + encodeURIComponent(word) +
-                "&file=" + encodeURIComponent((/^file:\/\/(?:\/)?(.+)$/.exec(model.uri.toString()) || [])[1] || "")
-              );
-              const targets = res.targets || [];
-              if (!targets.length) {
-                staticNavRef.current = null;
-                return null;
-              }
-              staticNavRef.current = { word, targets, index: 0 };
-              const t = targets[0];
+        const editor = editorRef.current;
+        const staticDef = async (model, position) => {
+          if (lspRef.current) return null; // LSP provider handles it
+          try {
+            const word = wordAt(model, position);
+            if (!word) return null;
+            const prev = staticNavRef.current;
+            if (prev && prev.word === word && prev.targets.length) {
+              const idx = (prev.index + 1) % prev.targets.length;
+              prev.index = idx;
+              const t = prev.targets[idx];
               await openFile(t.file);
               const ed = editorRef.current;
               if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
-              if (targets.length > 1) setEditorNotice(`Найдено объявлений: ${targets.length} («${word}») — F12 — следующее`);
-              return null;
-            } catch (e) {
-              console.error("[dsh-bsl-editor] static definition", e);
               return null;
             }
-          },
-        });
+            // model.uri.toString() percent-encodes non-ASCII paths — decode
+            // first, then let encodeURIComponent do exactly one level.
+            const curFile = decodeURIComponent((/^file:\/\/(?:\/)?(.+)$/.exec(model.uri.toString()) || [])[1] || "");
+            const res = await fetchJson(
+              "/bsl/find-symbol?name=" + encodeURIComponent(word) +
+              "&file=" + encodeURIComponent(curFile)
+            );
+            const targets = res.targets || [];
+            if (!targets.length) {
+              staticNavRef.current = null;
+              return null;
+            }
+            staticNavRef.current = { word, targets, index: 0 };
+            const t = targets[0];
+            await openFile(t.file);
+            const ed = editorRef.current;
+            if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
+            return null;
+          } catch (e) {
+            console.error("[dsh-bsl-editor] static definition", e);
+            return null;
+          }
+        };
+        const disp = monaco.languages.registerDefinitionProvider("bsl", { provideDefinition: staticDef });
+        // Intercept F12 so Monaco doesn't show its own "No definition found"
+        // toast on a miss — we do the navigation (and the toast) ourselves.
+        if (!f12BoundRef.current) {
+          f12BoundRef.current = editor.addCommand(monaco.KeyCode.F12, () => {
+            const ed = editorRef.current;
+            if (!ed) return;
+            if (lspRef.current) { ed.trigger(null, "editor.action.revealDefinition", null); return; }
+            const m = ed.getModel();
+            const pos = ed.getPosition();
+            if (m && pos) staticDef(m, pos);
+          });
+        }
         return () => disp.dispose();
       }, [monacoReady, openFile]);
 

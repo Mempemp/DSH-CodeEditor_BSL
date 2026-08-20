@@ -9,3 +9,7 @@ npm-debug.log*
 # OS / editor noise
 .DS_Store
 Thumbs.db
+dsh-bsl-editor/dsh-bsl-editor-0.1.0.tgz
+
+# npm pack artifacts
+*.tgz
