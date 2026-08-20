@@ -513,8 +513,11 @@ window.__ModuleLoader__.load({
       // separate effect once BOTH Monaco and LSP are ready. Bumping lspAttempt
       // (status-bar click) or changing settings re-runs this whole sequence.
       useEffect(() => {
-        // Master switch: LSP off — stand down and show nothing.
-        if (cfg && !cfg.lspEnabled) {
+        // Master switch: LSP off — or config not loaded yet — stand down.
+        // (cfg === null on first mount: the fetch below is still in flight;
+        // starting the server before knowing the switch state would spawn
+        // BSL even with lspEnabled: false.)
+        if (!cfg || !cfg.lspEnabled) {
           setLspReady(false);
           setLspError("");
           return;
@@ -925,11 +928,13 @@ window.__ModuleLoader__.load({
                 setEditorNotice(`«${word}» — ${idx + 1} из ${prev.targets.length}`);
                 return null;
               }
-              const res = await fetchJson("/bsl/find-symbol?name=" + encodeURIComponent(word));
+              const res = await fetchJson(
+                "/bsl/find-symbol?name=" + encodeURIComponent(word) +
+                "&file=" + encodeURIComponent((/^file:\/\/(?:\/)?(.+)$/.exec(model.uri.toString()) || [])[1] || "")
+              );
               const targets = res.targets || [];
               if (!targets.length) {
                 staticNavRef.current = null;
-                setEditorNotice("Не найдено: «" + word + "»");
                 return null;
               }
               staticNavRef.current = { word, targets, index: 0 };

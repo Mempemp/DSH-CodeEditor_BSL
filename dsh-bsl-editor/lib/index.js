@@ -387,14 +387,15 @@ async function handleMetaSearch(root, url, res) {
 }
 
 // Static go-to-definition via the metadata model (F12 without LSP):
-// «[Коллектор.]Модуль.Метод» resolves to the exact module, otherwise a
-// name-wide search across all .bsl files (cached per name).
+// «[Коллектор.]Модуль.Метод» resolves to the exact module; a bare method
+// name is looked up only in the currently open file.
 async function handleFindSymbol(root, url, res) {
   try {
     const m = getMetaModel(root);
     const name = (url.searchParams.get("name") || "").trim();
     if (!name) return json(res, 200, { targets: [] });
-    const { targets, resolved } = await m.resolveCall(name);
+    const currentFile = url.searchParams.get("file") || null;
+    const { targets, resolved } = await m.resolveCall(name, currentFile);
     json(res, 200, { targets, resolved });
   } catch (e) {
     json(res, 400, { error: e.message });
@@ -466,6 +467,11 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/lsp-start",
     handler: async (_req, res) => {
+      // Never spawn when LSP is disabled in settings — the client also
+      // respects this, but an old/stale client must not be able to start it.
+      if (config.lspEnabled === false) {
+        return json(res, 200, { ok: false, state: "disabled", reason: "LSP выключен в настройках", port: config.serverPort });
+      }
       // Trust the PORT, not the cached state: an adopted server may have died
       // since boot, leaving a stale "running" that would otherwise block a
       // respawn forever.

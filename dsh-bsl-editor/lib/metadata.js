@@ -794,27 +794,32 @@ export class MetaModel {
 
   // --- static navigation (F12 without LSP) --------------------------------
 
-  // Разрешить вызов «[Коллектор.]Модуль.Метод» через структуру метаданных:
-  // точный модуль, если имя резолвится; иначе — поиск объявлений по имени.
-  async resolveCall(call) {
+  // Разрешить вызов для F12. С точкой — «[Коллектор.]Модуль.Метод» через
+  // структуру метаданных (точный модуль). Без точки — объявление ищется
+  // только в currentFile (по всей конфигурации не ходим).
+  async resolveCall(call, currentFile = null) {
     await this.init();
     const parts = String(call).split(".").map((s) => s.trim()).filter(Boolean);
-    if (!parts.length) return { targets: [], resolved: false };
+    if (!parts.length) return { targets: [], resolved: true };
     const method = parts[parts.length - 1];
-    const ref = parts.length >= 2 ? parts[parts.length - 2] : "";
-    const collDir = parts.length >= 3 ? COLLECTORS[parts[parts.length - 3]] : null;
-    let candidates = [];
-    if (collDir && ref) candidates = this.moduleFilesForRef(ref, collDir);
-    if (!candidates.length && ref) candidates = this.moduleFilesForRef(ref);
-    if (candidates.length) {
+    if (parts.length >= 2) {
+      const ref = parts[parts.length - 2];
+      const collDir = parts.length >= 3 ? COLLECTORS[parts[parts.length - 3]] : null;
+      let candidates = [];
+      if (collDir && ref) candidates = this.moduleFilesForRef(ref, collDir);
+      if (!candidates.length && ref) candidates = this.moduleFilesForRef(ref);
       const targets = [];
       for (const { file } of candidates) {
         const hit = await this.findMethodInFile(file, method);
         if (hit) targets.push(hit);
       }
-      if (targets.length) return { targets, resolved: true };
+      return { targets, resolved: true };
     }
-    return { targets: await this.findMethodsByName(method), resolved: false };
+    if (currentFile) {
+      const hit = await this.findMethodInFile(currentFile, method);
+      return { targets: hit ? [hit] : [], resolved: true };
+    }
+    return { targets: [], resolved: true };
   }
 
   // Модули по имени объекта/модуля: DIRECT_MODULES (общие модули, HTTP-сервисы…)
@@ -850,55 +855,6 @@ export class MetaModel {
       }
     } catch {}
     return null;
-  }
-
-  // Fallback: объявления по имени во всех .bsl конфигурации. Ленивый кеш
-  // по имени; батч-чтение с дедлайном, чтобы не висеть на больших базах.
-  async findMethodsByName(name, limit = 50, deadlineMs = 20000) {
-    await this.init();
-    if (this._symbolCache && this._symbolCache.has(name)) return this._symbolCache.get(name);
-    const files = await this.allModuleFiles();
-    const re = new RegExp("(?:Процедура|Функция)\\s+" + escapeRegExp(name) + "\\s*\\(", "i");
-    const hits = [];
-    const deadline = Date.now() + deadlineMs;
-    for (let i = 0; i < files.length && Date.now() < deadline; i += 64) {
-      const chunk = files.slice(i, i + 64);
-      const texts = await Promise.all(chunk.map((f) => fs.readFile(f, "utf-8").catch(() => null)));
-      for (let k = 0; k < chunk.length; k++) {
-        if (texts[k] == null) continue;
-        const lines = texts[k].split(/\r?\n/);
-        for (let j = 0; j < lines.length; j++) {
-          if (re.test(lines[j])) {
-            const col = lines[j].indexOf(name) + 1;
-            hits.push({ file: chunk[k], line: j + 1, col: col > 0 ? col : 1 });
-            if (hits.length >= limit) break;
-          }
-        }
-        if (hits.length >= limit) break;
-      }
-      if (hits.length >= limit) break;
-    }
-    this._symbolCache = this._symbolCache || new Map();
-    this._symbolCache.set(name, hits);
-    return hits;
-  }
-
-  async allModuleFiles() {
-    if (this._bslFiles) return this._bslFiles;
-    const out = [];
-    const walk = async (dir) => {
-      let ents;
-      try { ents = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of ents) {
-        if (e.name === ".git" || e.name === "node_modules" || e.name === ".dsh") continue;
-        const p = join(dir, e.name);
-        if (e.isDirectory()) await walk(p);
-        else if (e.name.toLowerCase().endsWith(".bsl")) out.push(p);
-      }
-    };
-    await walk(this.configRoot);
-    this._bslFiles = out;
-    return out;
   }
 
   // --- top-level dispatch ----------------------------------------------------
