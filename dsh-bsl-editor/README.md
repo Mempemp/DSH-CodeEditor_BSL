@@ -1,20 +1,11 @@
 # dsh-bsl-editor
 
-DeepSeek Harness plugin: a **1C:Enterprise (BSL) code editor** in one window —
-file tree with git-change badges, a Monaco editor (loaded from a CDN), and full
-LSP via **bsl-language-server** (diagnostics, completion, hover,
-go-to-definition, formatting) over a native WebSocket. No code-server, no
-C++ toolchain, no Docker.
+DeepSeek Harness plugin: a **1C:Enterprise (BSL) code editor** in one window.
 
-## How it works
-
-- **Host half** spawns `bsl-language-server -w` (its built-in WebSocket mode,
-  Tomcat on a loopback port, LSP at `/lsp`) and exposes JSON routes for the
-  file tree (`/bsl/tree`), reads (`/bsl/read`), git status (`/bsl/git-status`),
-  git diff (`/bsl/git-diff`) and LSP lifecycle (`/bsl/lsp-status`, `/bsl/lsp-start`).
-- **Client half** adds a `1С` tab to the conversation view: a file tree on the
-  left and a Monaco editor on the right. Monaco loads from jsdelivr; the LSP
-  client is a native `WebSocket` to `ws://127.0.0.1:<port>/lsp`.
+- File tree of the current DSH workspace — lazy-loading, git M/A/D badges, filename search, resizable panel.
+- Monaco editor (CDN, no build step) with BSL syntax highlighting and per-extension language detection.
+- Optional LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — off by default.
+- No code-server, no Docker.
 
 ## Install
 
@@ -22,10 +13,10 @@ C++ toolchain, no Docker.
 dsh plugin --profile web add dsh-bsl-editor
 ```
 
-The plugin expects `bsl-language-server.exe` at
+The plugin reads the workspace root from DSH's workspace registry — no manual path.
+For LSP it expects `bsl-language-server.exe` at
 `%LOCALAPPDATA%\Programs\bsl-language-server\bsl-language-server\bsl-language-server.exe`
-(the `bsl-language-server_win.zip` release layout). Point `serverBin` elsewhere
-if needed.
+(the `bsl-language-server_win.zip` release layout).
 
 ## Configuration
 
@@ -33,11 +24,11 @@ if needed.
 |---|---|---|
 | `serverPort` | `8025` | bsl-language-server WebSocket port |
 | `serverBin` | `""` | explicit path; empty = the standard install location |
-| `workspaceDir` | `""` | workspace root; empty = dsh cwd |
+| `workspaceDir` | `""` | workspace root override; empty = the DSH workspace |
 | `sourceExtensions` | `[".bsl", ".os"]` | text sources opened as code |
 
-## Roadmap
+## Structure
 
-- Inline git diff view (Monaco diff editor between HEAD and working tree).
-- Syntax highlighting via the official TextMate grammar (vs hand-written Monarch).
-- MCP endpoint of bsl-language-server exposed to the agent.
+- `lib/index.js` — host half (ESM): `/bsl/*` routes (tree, read, search, git), optional bsl-language-server spawn.
+- `lib/client.js` — client half: the `Editor` conversation-view tab (tree + Monaco).
+- `cordis.patch.yml` — bundle patch mounting the plugin row.

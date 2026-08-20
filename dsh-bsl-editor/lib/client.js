@@ -311,6 +311,13 @@ window.__ModuleLoader__.load({
           monaco.languages.register({ id: "bsl" });
           monaco.languages.setMonarchTokensProvider("bsl", bslMonarch());
           monaco.languages.setLanguageConfiguration("bsl", { comments: { lineComment: "//" } });
+          const composerClearance = (() => {
+            try {
+              const v = getComputedStyle(document.documentElement).getPropertyValue("--dsh-composer-height").trim();
+              const n = parseInt(v, 10);
+              return (Number.isFinite(n) && n > 0 ? n : 152) + 16;
+            } catch { return 168; }
+          })();
           const editor = monaco.editor.create(containerRef.current, {
             value: "",
             language: "bsl",
@@ -318,6 +325,8 @@ window.__ModuleLoader__.load({
             automaticLayout: true,
             minimap: { enabled: true },
             fontSize: 14,
+            scrollBeyondLastLine: false,
+            padding: { top: 0, bottom: composerClearance },
           });
           editorRef.current = editor;
           if (alive) setMonacoReady(true);
@@ -447,47 +456,11 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, []);
 
-      // Pin the editor root to the DSH scroll body's actual height. DSH lays the
-      // conversation view out inside `.scrollBody` (overflow: hidden auto); in the
-      // "active" composer phase the intermediate `.viewArea` switches to
-      // `flex: 1 0 auto; min-height: auto` (it grows to content), which would let
-      // our tree + Monaco grow unbounded and fight the browser scrollbar. Measuring
-      // the nearest scroll ancestor and pinning our height to it makes the tree the
-      // ONLY scroller in every phase.
-      useEffect(() => {
-        const el = rootRef.current;
-        if (!el) return;
-        let scrollAncestor = null;
-        const findScroll = () => {
-          let n = el.parentElement;
-          while (n) {
-            const oy = window.getComputedStyle(n).overflowY;
-            if (oy === "auto" || oy === "scroll") return n;
-            n = n.parentElement;
-          }
-          return null;
-        };
-        const fit = () => {
-          if (!scrollAncestor) scrollAncestor = findScroll();
-          if (!scrollAncestor) return;
-          // The composer seat is the scroll body's trailing child; reserve its
-          // height so the editor fills everything above it and never pushes the
-          // browser scrollbar. (Slot anchors are display:contents, so the view
-          // area lays out as a direct flex child of the scroll body.)
-          let reserve = 0;
-          for (const c of scrollAncestor.children) {
-            if (!c.contains(el)) reserve = Math.max(reserve, c.offsetHeight);
-          }
-          const h = Math.max(0, scrollAncestor.clientHeight - reserve);
-          if (h > 0 && el.style.height !== h + "px") el.style.height = h + "px";
-        };
-        fit();
-        const ro = new ResizeObserver(fit);
-        if (scrollAncestor) ro.observe(scrollAncestor);
-        if (el.parentElement && el.parentElement !== scrollAncestor) ro.observe(el.parentElement);
-        window.addEventListener("resize", fit);
-        return () => { ro.disconnect(); window.removeEventListener("resize", fit); };
-      }, []);
+      // Layout: the editor root sets `data-conversation-composer-overlay` (same
+      // mechanism as the Trajectory view). DSH then bounds the view area with
+      // `flex:1 1 0; min-height:0; overflow:hidden` and floats the composer over
+      // the bottom with a fade gradient — so we don't pin our own height; the tree
+      // and Monaco just need bottom clearance to scroll above the composer.
 
       const loadDir = useCallback(async (path) => {
         try {
@@ -745,7 +718,7 @@ window.__ModuleLoader__.load({
         });
       };
 
-      return jsxs("div", { ref: rootRef, style: { display: "flex", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
+      return jsxs("div", { ref: rootRef, "data-conversation-composer-overlay": "", style: { display: "flex", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
         jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [
           jsxs("div", { style: { padding: "2px 6px 6px", flexShrink: 0 }, children: [
             jsx("div", { style: { padding: "0 4px 6px", fontSize: 12, opacity: 0.7 }, children: rootTitle || "Проект" }),
@@ -762,7 +735,7 @@ window.__ModuleLoader__.load({
               },
             }),
           ]}),
-          jsx("div", { ref: treeBodyRef, style: { flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "0 6px 8px" }, children: search.trim()
+          jsx("div", { ref: treeBodyRef, style: { flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "0 6px 8px", paddingBottom: "calc(var(--dsh-composer-height, 152px) + 16px)" }, children: search.trim()
             ? renderSearchResults()
             : jsxs(React.Fragment, { children: [
                 jsx("div", { style: { padding: "0 10px 4px", fontSize: 11, color: "#8a8a8a" }, children: "LSP: выключен" }),
