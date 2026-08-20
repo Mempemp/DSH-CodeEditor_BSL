@@ -1,0 +1,4 @@
+# dsh-bsl-editor bundle patch
+- insert:
+    - id: bsl-editor
+      name: 'dsh-bsl-editor'

@@ -1,0 +1,10 @@
+# dsh-ide-switch bundle patch
+#
+# Installed via:  dsh plugin --profile <name> add dsh-ide-switch
+# The CLI reconciles dsh.profile.bundles against installed packages and,
+# seeing the dsh.bundle.patch declaration, appends this package to the
+# bundle stack. The profile boot then merges THIS patch (a single insert
+# of the plugin row).
+- insert:
+    - id: ide-switch
+      name: 'dsh-ide-switch'
