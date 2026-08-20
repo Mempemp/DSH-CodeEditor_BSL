@@ -113,6 +113,18 @@ window.__ModuleLoader__.load({
       return res.json();
     }
 
+    // Identifier (with dotted module prefixes) under the cursor, e.g.
+    // «АБСП_HTTPСервисЗапросы.ОбработатьЗапрос» for F12.
+    function wordAt(model, position) {
+      const line = model.getLineContent(position.lineNumber);
+      const left = line.slice(0, position.column - 1);
+      const right = line.slice(position.column - 1);
+      const ml = left.match(/[\wА-Яа-яЁё]+(?:\.[\wА-Яа-яЁё]+)*\.?$/);
+      const mr = right.match(/^[\wА-Яа-яЁё]*/);
+      const w = (ml ? ml[0] : "") + (mr ? mr[0] : "");
+      return w.replace(/\.$/, "").trim() || null;
+    }
+
     // ── Monaco (CDN, with fallbacks) ──────────────────────────────────────
     // Some hosts (a sibling plugin bundle, an embedded webview, a bundler
     // polyfill) define globals that make monaco's AMD loader misdetect its
@@ -462,6 +474,7 @@ window.__ModuleLoader__.load({
       const treeBodyRef = useRef(null);
       const draggingRef = useRef(false);
       const rootPathRef = useRef("");
+      const staticNavRef = useRef(null); // { word, targets, index } for F12 cycling
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
 
       // Fetch the workspace title. LSP is intentionally deferred — the editor
@@ -489,7 +502,7 @@ window.__ModuleLoader__.load({
         fetchJson("/bsl/config")
           .then((c) => { if (alive) setCfg(c); })
           .catch(() => {
-            if (alive) setCfg({ lspEnabled: true, serverPort: 8025, serverBin: "", sourceExtensions: [".bsl", ".os"], workspaceDir: "" });
+            if (alive) setCfg({ lspEnabled: false, serverPort: 8025, serverBin: "", sourceExtensions: [".bsl", ".os"], workspaceDir: "" });
           });
         return () => { alive = false; };
       }, []);
@@ -888,6 +901,52 @@ window.__ModuleLoader__.load({
           disposables.forEach((d) => { if (d && typeof d.dispose === "function") d.dispose(); });
         };
       }, [monacoReady, lspReady]);
+
+      // Static go-to-definition (F12) via the metadata model — active when LSP
+      // is off/unavailable. Exact resolution for «[Коллектор.]Модуль.Метод»,
+      // otherwise a name-wide search; repeated F12 cycles through candidates.
+      useEffect(() => {
+        if (!monacoReady || !monacoRef.current || !editorRef.current) return;
+        const monaco = monacoRef.current;
+        const disp = monaco.languages.registerDefinitionProvider("bsl", {
+          provideDefinition: async (model, position) => {
+            if (lspRef.current) return null; // LSP provider handles it
+            try {
+              const word = wordAt(model, position);
+              if (!word) return null;
+              const prev = staticNavRef.current;
+              if (prev && prev.word === word && prev.targets.length) {
+                const idx = (prev.index + 1) % prev.targets.length;
+                prev.index = idx;
+                const t = prev.targets[idx];
+                await openFile(t.file);
+                const ed = editorRef.current;
+                if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
+                setEditorNotice(`«${word}» — ${idx + 1} из ${prev.targets.length}`);
+                return null;
+              }
+              const res = await fetchJson("/bsl/find-symbol?name=" + encodeURIComponent(word));
+              const targets = res.targets || [];
+              if (!targets.length) {
+                staticNavRef.current = null;
+                setEditorNotice("Не найдено: «" + word + "»");
+                return null;
+              }
+              staticNavRef.current = { word, targets, index: 0 };
+              const t = targets[0];
+              await openFile(t.file);
+              const ed = editorRef.current;
+              if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
+              if (targets.length > 1) setEditorNotice(`Найдено объявлений: ${targets.length} («${word}») — F12 — следующее`);
+              return null;
+            } catch (e) {
+              console.error("[dsh-bsl-editor] static definition", e);
+              return null;
+            }
+          },
+        });
+        return () => disp.dispose();
+      }, [monacoReady, openFile]);
 
       useEffect(() => { loadDir(""); refreshGit(); }, [loadDir, refreshGit]);
 
@@ -1412,7 +1471,7 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: true, serverPort: 8025, serverBin: "" });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "" });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;

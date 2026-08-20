@@ -5,7 +5,8 @@ DeepSeek Harness plugin: a **1C:Enterprise (BSL) code editor** in one window.
 - File tree of the current DSH workspace — lazy-loading, git M/A/D badges, filename search, resizable panel.
 - **1C metadata tree** — a «Файлы | Метаданные» switch rebuilds the tree as a 1C:Enterprise metadata tree with per-type icons: Подсистемы, Справочники, Документы, Регистры, Общие модули, … → объекты → Реквизиты / Табличные части / Формы / Команды / Макеты / Модули. Click a module and it opens in the editor.
 - Monaco editor (CDN, no build step) with BSL syntax highlighting and per-extension language detection.
-- LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — auto-starts when the Editor tab opens; status bar at the bottom shows the connection state (click retries a failed connection).
+- **F12 go-to-definition without LSP** — resolves «[Коллектор.]Модуль.Метод» through the metadata model (exact module), falls back to a name-wide search across all modules (repeated F12 cycles through candidates).
+- LSP via **bsl-language-server** (diagnostics, completion, hover, go-to-definition, formatting) over WebSocket — **off by default** (unstable on large configurations). Enable it in DSH Settings → «1С-редактор»; status bar on top shows the connection state (click retries).
 - No code-server, no Docker.
 
 ## Metadata tree: supported dump formats
@@ -41,6 +42,7 @@ For LSP it expects `bsl-language-server.exe` at
 | `serverBin` | `""` | explicit path; empty = the standard install location |
 | `workspaceDir` | `""` | workspace root override; empty = the DSH workspace |
 | `sourceExtensions` | `[".bsl", ".os"]` | text sources opened as code |
+| `lspEnabled` | `false` | master LSP switch (Settings → «1С-редактор») |
 
 ## Structure
 

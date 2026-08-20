@@ -27,8 +27,8 @@ export const Config = z.object({
   workspaceDir: z.string().default(""),
   /** File extensions treated as BSL/OS sources. */
   sourceExtensions: z.array(z.string()).default([".bsl", ".os"]),
-  /** Master switch: when false the client skips LSP entirely. */
-  lspEnabled: z.boolean().default(true),
+  /** LSP master switch; off by default — unstable on large configurations. */
+  lspEnabled: z.boolean().default(false),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -386,6 +386,21 @@ async function handleMetaSearch(root, url, res) {
   }
 }
 
+// Static go-to-definition via the metadata model (F12 without LSP):
+// «[Коллектор.]Модуль.Метод» resolves to the exact module, otherwise a
+// name-wide search across all .bsl files (cached per name).
+async function handleFindSymbol(root, url, res) {
+  try {
+    const m = getMetaModel(root);
+    const name = (url.searchParams.get("name") || "").trim();
+    if (!name) return json(res, 200, { targets: [] });
+    const { targets, resolved } = await m.resolveCall(name);
+    json(res, 200, { targets, resolved });
+  } catch (e) {
+    json(res, 400, { error: e.message });
+  }
+}
+
 function handleIcon(_root, url, res) {
   const name = (url.pathname || "").split("/").pop().replace(/\.svg$/i, "");
   const p = svgIconFile(name);
@@ -553,6 +568,10 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/meta/search",
     handler: (req, res) => handleMetaSearch(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/find-symbol",
+    handler: (req, res) => handleFindSymbol(root, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/icons",
