@@ -13,3 +13,6 @@ dsh-bsl-editor/dsh-bsl-editor-0.1.0.tgz
 
 # npm pack artifacts
 *.tgz
+
+# local-only tests (need the user's environment)
+dsh-bsl-editor/tests/

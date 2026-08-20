@@ -10,7 +10,7 @@
 //
 // The model is lazy: top level lists groups, groups list objects, objects list
 // sections, sections list items. Only what the user expands gets parsed, so a
-// ЗУП-scale config stays instant. Parsed artifacts (Configuration.mdo,
+// Large-scale config stays instant. Parsed artifacts (Configuration.mdo,
 // ConfigDumpInfo.xml, per-object .xml) are cached.
 //
 // Node keys are config-root-relative posix paths: "Catalogs", "Catalogs/Товары",
@@ -659,7 +659,7 @@ export class MetaModel {
   }
 
   // Folders on disk fill in forms/commands/templates even when the def xml
-  // carries only Properties (the hrm1 dump variant).
+  // carries only Properties (the object-by-object dump variant).
   async mergeFolderChildren(dir, objName, def) {
     const base = join(this.configRoot, dir, objName);
     const add = async (field, sub, itemTag, labelFile) => {
