@@ -74,6 +74,11 @@ const MAIN_GROUPS = [
 
 const DIRS = new Set([...COMMON_GROUPS, ...MAIN_GROUPS].map(([d]) => d));
 
+const GROUP_LABEL = new Map([...COMMON_GROUPS, ...MAIN_GROUPS].map(([dir, label]) => [dir, label]));
+function groupLabel(dir) {
+  return GROUP_LABEL.get(dir) || dir;
+}
+
 // EDT Configuration.mdo property names per type dir (try both spellings —
 // EDT's schema has a known "accomulationRegisters" typo).
 const MDO_PROP = Object.fromEntries([
@@ -460,18 +465,35 @@ export class MetaModel {
       case "forms": {
         const out = [];
         for (const f of src) {
-          const file = this.formModuleFile(dir, objName, f.name) ?? this.objFile(dir, objName, "Forms", f.name + ".xml");
-          out.push({ key: null, label: f.name, icon: "form", file });
+          // Left click opens the form MODULE when it exists; the XML twin is
+          // offered via the context menu. If there is no module file, file is
+          // null and the client shows a notice instead of silently opening XML.
+          const moduleFile = this.formModuleFile(dir, objName, f.name);
+          const xmlFile = this.objFile(dir, objName, "Forms", f.name + ".xml");
+          out.push({
+            key: null,
+            label: f.name,
+            icon: "form",
+            file: moduleFile,
+            xmlFile,
+            hint: moduleFile ? "модуль" : "нет модуля",
+          });
         }
         return out;
       }
       case "commands": {
         const out = [];
         for (const c of src) {
-          const file =
-            this.objFile(dir, objName, "Commands", c.name, "Ext", "CommandModule.bsl") ??
-            this.objFile(dir, objName, "Commands", c.name + ".xml");
-          out.push({ key: null, label: c.name, icon: "command", file });
+          const moduleFile = this.objFile(dir, objName, "Commands", c.name, "Ext", "CommandModule.bsl");
+          const xmlFile = this.objFile(dir, objName, "Commands", c.name + ".xml");
+          out.push({
+            key: null,
+            label: c.name,
+            icon: "command",
+            file: moduleFile,
+            xmlFile,
+            hint: moduleFile ? "модуль" : "нет модуля",
+          });
         }
         return out;
       }
@@ -481,6 +503,7 @@ export class MetaModel {
           label: t.name,
           icon: "template",
           file: this.objFile(dir, objName, "Templates", t.name + ".xml"),
+          hint: "XML",
         }));
       default:
         return src.map((x) => ({ key: null, label: x.name, icon }));
@@ -730,20 +753,27 @@ export class MetaModel {
     if (!needle) return [];
     const out = [];
     const seen = new Set();
+    // Human-readable hierarchy path for a result: "Справочники / Товары",
+    // "Общие / Общие модули / Имя", ...
+    const pushResult = (o, dir, isCommon) => {
+      if (seen.has(o.key)) return;
+      seen.add(o.key);
+      const segs = String(o.key).split("/");
+      const path = [isCommon ? "Общие" : null, groupLabel(dir), ...segs.slice(1)].filter(Boolean).join(" / ");
+      out.push({ key: o.key, label: o.label, icon: o.icon, path });
+    };
     for (const g of this.groupsCache ?? []) {
       if (g.children) continue; // "Общие" — its groups are listed separately below
       if (g.key && g.count) {
         const objs = await this.listObjects(g.key);
         for (const o of objs) {
           if (o.label.toLowerCase().includes(needle)) {
-            if (seen.has(o.key)) continue;
-            seen.add(o.key);
-            out.push({ key: o.key, label: o.label, icon: o.icon });
+            pushResult(o, g.key, false);
             if (out.length >= 300) return out;
           }
         }
       } else if (g.file) {
-        if (g.label.toLowerCase().includes(needle)) out.push(g);
+        if (g.label.toLowerCase().includes(needle)) out.push({ ...g, path: "Модули конфигурации" });
       }
     }
     // "Общие" subgroups
@@ -753,9 +783,7 @@ export class MetaModel {
         const objs = await this.listObjects(sub.key);
         for (const o of objs) {
           if (o.label.toLowerCase().includes(needle)) {
-            if (seen.has(o.key)) continue;
-            seen.add(o.key);
-            out.push({ key: o.key, label: o.label, icon: o.icon });
+            pushResult(o, sub.key, true);
             if (out.length >= 300) return out;
           }
         }

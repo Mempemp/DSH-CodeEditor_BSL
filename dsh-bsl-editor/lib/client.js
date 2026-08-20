@@ -277,6 +277,8 @@ window.__ModuleLoader__.load({
       const [metaError, setMetaError] = useState("");
       const [metaLoading, setMetaLoading] = useState(false);
       const [metaHighlight, setMetaHighlight] = useState(null);
+      const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
+      const [ctxMenu, setCtxMenu] = useState(null); // { x, y, item } — meta-tree context menu
 
       const joinPath = (parent, name) => parent + (parent.endsWith("/") || parent.endsWith("\\") ? "" : "\\") + name;
 
@@ -298,7 +300,7 @@ window.__ModuleLoader__.load({
         if (!document.querySelector("style[data-dsh-bsl-tree-css]")) {
           const st = document.createElement("style");
           st.setAttribute("data-dsh-bsl-tree-css", "1");
-          st.textContent = ".dsh-bsl-row:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsh-bsl-resizer{background:transparent;transition:background .12s}.dsh-bsl-resizer:hover{background:var(--dsw-alias-state-business-primary)}";
+          st.textContent = ".dsh-bsl-row:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsh-bsl-resizer{background:transparent;transition:background .12s}.dsh-bsl-resizer:hover{background:var(--dsw-alias-state-business-primary)}.dsh-bsl-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}";
           document.head.appendChild(st);
         }
         let alive = true;
@@ -506,6 +508,7 @@ window.__ModuleLoader__.load({
       }, []);
 
       const openFile = useCallback(async (fullPath) => {
+        setEditorNotice(null);
         try {
           const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
           setOpenPath(data.path);
@@ -651,14 +654,23 @@ window.__ModuleLoader__.load({
       }, [mode, metaInfo, metaChildren, loadMeta]);
 
       // Reveal a metadata node: expand every ancestor segment, then highlight.
+      // «Общие» is a virtual parent for common-type groups (Общие модули, …),
+      // so its segment must be walked too — otherwise the row never renders
+      // and the scroll/highlight silently misses.
       const revealMeta = useCallback(async (key) => {
         setSearch("");
         const segs = String(key || "").split("/").filter(Boolean);
+        const rootItems = metaChildren.get("") || [];
+        const common = rootItems.find((g) => g.key === "Общие");
+        const commonDirs = new Set((common?.children || []).map((c) => c.key));
+        const chain = [];
+        for (const seg of segs) {
+          if (chain.length === 0 && commonDirs.has(seg)) chain.push("Общие");
+          chain.push(chain.length ? chain[chain.length - 1] + "/" + seg : seg);
+        }
         const newExpanded = new Set(metaExpanded);
         const loaded = new Set(metaChildren.keys());
-        let acc = "";
-        for (const seg of segs) {
-          acc = acc ? acc + "/" + seg : seg;
+        for (const acc of chain) {
           if (!loaded.has(acc)) await loadMeta(acc);
           loaded.add(acc);
           newExpanded.add(acc);
@@ -682,18 +694,42 @@ window.__ModuleLoader__.load({
         }
       }, [highlightPath, expanded, children, search]);
 
-      // Same for metadata-mode highlight.
+      // Same for metadata-mode highlight — scroll ONLY when the highlighted
+      // node changes (not on every expand/collapse, which made the view
+      // "jump back" to a stale highlight).
+      const metaScrollRef = useRef(null);
       useEffect(() => {
-        if (!metaHighlight) return;
+        if (!metaHighlight || metaHighlight === metaScrollRef.current) return;
         const list = treeBodyRef.current?.querySelectorAll("[data-meta-path]");
-        if (!list) return;
-        for (const el of list) {
-          if (el.dataset.metaPath === metaHighlight) {
-            el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-            break;
+        let found = false;
+        if (list) {
+          for (const el of list) {
+            if (el.dataset.metaPath === metaHighlight) {
+              el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+              found = true;
+              break;
+            }
           }
         }
+        // Only mark as scrolled when the row actually rendered — otherwise
+        // retry on the next state change.
+        if (found) metaScrollRef.current = metaHighlight;
       }, [metaHighlight, metaExpanded, metaChildren, search]);
+
+      // Auto-hide the editor notice.
+      useEffect(() => {
+        if (!editorNotice) return;
+        const t = setTimeout(() => setEditorNotice(null), 7000);
+        return () => clearTimeout(t);
+      }, [editorNotice]);
+
+      // Close the context menu on Escape.
+      useEffect(() => {
+        if (!ctxMenu) return;
+        const onKey = (e) => { if (e.key === "Escape") setCtxMenu(null); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [ctxMenu]);
 
       // Drag the divider between tree and editor to resize the tree.
       const startDrag = useCallback((e) => {
@@ -786,7 +822,7 @@ window.__ModuleLoader__.load({
           return searchResults.map((r) => jsxs("div", {
             key: r.key ?? r.label,
             className: "dsh-bsl-row",
-            onClick: () => (r.file ? openFile(r.file) : revealMeta(r.key)),
+            onClick: () => (r.file ? (openFile(r.file), setMetaHighlight(r.file)) : revealMeta(r.key)),
             style: {
               boxSizing: "border-box", width: "100%", maxWidth: "100%", height: 34,
               font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
@@ -797,7 +833,7 @@ window.__ModuleLoader__.load({
             children: [
               iconBox(metaIcon(r.icon)),
               jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: r.label }),
-              jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap" }, children: r.key }),            ],
+              jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap" }, children: r.path || r.key }),            ],
           }));
         }
         return searchResults.map((r) => {
@@ -854,13 +890,25 @@ window.__ModuleLoader__.load({
 
       const renderMetaRows = (items, depth) => (items || []).map((item) => {
         const full = item.key;
+        const nodeId = full ?? item.file; // leafs highlight by their file path
         const isOpen = full != null && metaExpanded.has(full);
-        const isActive = metaHighlight != null && full === metaHighlight;
+        const isActive = metaHighlight != null && nodeId === metaHighlight;
         const onClick = item.file
-          ? () => openFile(item.file)
+          ? () => { openFile(item.file); setMetaHighlight(nodeId); }
           : full
-          ? () => metaToggle(full)
+          ? () => { metaToggle(full); setMetaHighlight(nodeId); }
+          : item.xmlFile
+          ? () => {
+              setEditorNotice("Модуль «" + item.label + "» не найден. Откройте XML правой кнопкой мыши.");
+              setMetaHighlight(nodeId);
+            }
           : undefined;
+        const onCtx = (e) => {
+          if (!item.file && !item.xmlFile) return;
+          e.preventDefault();
+          e.stopPropagation();
+          setCtxMenu({ x: e.clientX, y: e.clientY, item });
+        };
         const sub = isOpen
           ? metaChildren.has(full)
             ? renderMetaLevel(full, depth + 1)
@@ -873,8 +921,9 @@ window.__ModuleLoader__.load({
           children: [
             jsx("div", {
               className: "dsh-bsl-row",
-              "data-meta-path": full ?? "",
+              "data-meta-path": nodeId ?? "",
               onClick,
+              onContextMenu: onCtx,
               style: {
                 ...metaRowStyle(isActive),
                 paddingLeft: depth * 22 + 6,
@@ -882,6 +931,7 @@ window.__ModuleLoader__.load({
               children: [
                 iconBox(metaIcon(item.icon)),
                 jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: item.label }),
+                item.hint ? jsx("span", { style: { marginLeft: 6, fontSize: 11, opacity: 0.55, flexShrink: 0, fontStyle: "italic" }, children: item.hint }) : null,
                 item.count ? jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5 }, children: item.count }) : null,
                 gitBadge(item.file, "file"),
               ],
@@ -966,7 +1016,32 @@ window.__ModuleLoader__.load({
         }),
         jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
           !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13 }, children: "Загрузка редактора…" }) : null,
+          editorNotice ? jsx("div", { style: { position: "absolute", top: 10, left: 10, right: 10, zIndex: 10, padding: "10px 14px", borderRadius: 10, background: "rgba(244,67,54,.1)", border: "1px solid rgba(244,67,54,.45)", color: "var(--dsw-alias-label-primary)", font: "var(--dsw-font-s-14)", pointerEvents: "none", boxShadow: "0 4px 16px rgba(0,0,0,.25)" }, children: editorNotice }) : null,
         ]}),
+        ctxMenu ? jsxs(React.Fragment, { children: [
+          jsx("div", { style: { position: "fixed", inset: 0, zIndex: 2147482900, background: "transparent" }, onMouseDown: () => setCtxMenu(null), onContextMenu: (e) => { e.preventDefault(); setCtxMenu(null); } }),
+          jsx("div", {
+            onMouseDown: (e) => e.stopPropagation(),
+            style: {
+              position: "fixed",
+              left: Math.min(ctxMenu.x, (typeof window !== "undefined" ? window.innerWidth : 1200) - 210),
+              top: Math.min(ctxMenu.y, (typeof window !== "undefined" ? window.innerHeight : 800) - 130),
+              minWidth: 190,
+              zIndex: 2147482901,
+              background: "var(--dsw-alias-bg-layer-2)",
+              border: "1px solid var(--dsw-alias-border-l2)",
+              borderRadius: 10,
+              boxShadow: "0 8px 30px rgba(0,0,0,.45)",
+              padding: 4,
+              font: "var(--dsw-font-s-14)",
+              color: "var(--dsw-alias-label-primary)",
+            },
+            children: [
+              ctxMenu.item.file ? jsx("div", { className: "dsh-bsl-menu-item", onClick: () => { openFile(ctxMenu.item.file); setCtxMenu(null); }, style: { padding: "6px 10px", borderRadius: 6, cursor: "pointer", whiteSpace: "nowrap" }, children: "Открыть файл" }) : null,
+              ctxMenu.item.xmlFile ? jsx("div", { className: "dsh-bsl-menu-item", onClick: () => { openFile(ctxMenu.item.xmlFile); setCtxMenu(null); }, style: { padding: "6px 10px", borderRadius: 6, cursor: "pointer", whiteSpace: "nowrap" }, children: "Открыть XML" }) : null,
+            ],
+          }),
+        ]}) : null,
       ]});
     }
 
