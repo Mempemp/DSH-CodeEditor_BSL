@@ -213,49 +213,57 @@ window.__ModuleLoader__.load({
     // via monaco-textmate@3 + onigasm. The grammar JSON itself is served
     // same-origin by the host (/bsl/grammar/1c) — no runtime CDN dependency.
     // On any failure the hand-written Monarch grammar stays as the fallback.
-    async function wireTmGrammar(monaco) {
-      try {
-        // monaco-textmate@3 uses onigasm INTERNALLY from a fixed jsdelivr URL
-        // — its WASM must be initialized through that exact module instance,
-        // so no CDN fallback for the module itself.
-        const onigasm = await import("https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm");
-        let wasm = null;
-        for (const u of [
-          "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/lib/onigasm.wasm",
-          "https://esm.sh/onigasm@2.2.2/lib/onigasm.wasm",
-        ]) {
+    //
+    // onigasm.loadWASM may run exactly ONCE per page, but the editor mounts
+    // again on every session switch (DSH recreates the component), so the
+    // whole TM stack (onigasm + grammar registry) is a module-level singleton:
+    // the first wireTmGrammar call loads it, later calls reuse the loaded
+    // grammar and only re-register the tokens provider on the new Monaco.
+    let tmStackPromise = null;
+    function getTmStack() {
+      if (!tmStackPromise) {
+        tmStackPromise = (async () => {
+          // monaco-textmate@3 uses onigasm INTERNALLY from a fixed jsdelivr URL
+          // — its WASM must be initialized through that exact module instance,
+          // so no CDN fallback for the module itself.
+          const onigasm = await import("https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm");
+          let wasm = null;
+          for (const u of [
+            "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/lib/onigasm.wasm",
+            "https://esm.sh/onigasm@2.2.2/lib/onigasm.wasm",
+          ]) {
+            try {
+              const r = await fetch(u);
+              if (r.ok) { wasm = await r.arrayBuffer(); break; }
+            } catch {}
+          }
+          if (!wasm) throw new Error("onigasm.wasm недоступен");
+          await onigasm.loadWASM(wasm);
+          let tm;
           try {
-            const r = await fetch(u);
-            if (r.ok) { wasm = await r.arrayBuffer(); break; }
-          } catch {}
-        }
-        if (!wasm) throw new Error("onigasm.wasm недоступен");
-        await onigasm.loadWASM(wasm);
-        let tm;
-        try {
-          tm = await import("https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm");
-        } catch {
-          tm = await import("https://esm.sh/monaco-textmate@3.0.1");
-        }
-        const [bslRes, queryRes] = await Promise.all([
-          fetch("/bsl/grammar/1c"),
-          fetch("/bsl/grammar/1c-query"),
-        ]);
-        if (!bslRes.ok) throw new Error("grammar HTTP " + bslRes.status);
-        const grammarJson = await bslRes.json();
-        const queryJson = queryRes.ok ? await queryRes.json() : null;
-        // The BSL grammar references the 1C-query grammar by its official
-        // scopeName ("source.sdbl" — a dependency for highlighting text-query
-        // strings), so the locator must serve it; plus a minimal fallback for
-        // any other unknown scope so the registry never hard-fails.
-        const defs = new Map([[grammarJson.scopeName, { format: "json", content: grammarJson }]]);
-        if (queryJson && queryJson.scopeName) defs.set(queryJson.scopeName, { format: "json", content: queryJson });
-        const registry = new tm.Registry({
-          getGrammarDefinition: async (scopeName) =>
-            defs.get(scopeName) || { format: "json", content: { scopeName, patterns: [], repository: {} } },
-        });
-        const grammar = await registry.loadGrammar(grammarJson.scopeName);
-        if (grammar) {
+            tm = await import("https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm");
+          } catch {
+            tm = await import("https://esm.sh/monaco-textmate@3.0.1");
+          }
+          const [bslRes, queryRes] = await Promise.all([
+            fetch("/bsl/grammar/1c"),
+            fetch("/bsl/grammar/1c-query"),
+          ]);
+          if (!bslRes.ok) throw new Error("grammar HTTP " + bslRes.status);
+          const grammarJson = await bslRes.json();
+          const queryJson = queryRes.ok ? await queryRes.json() : null;
+          // The BSL grammar references the 1C-query grammar by its official
+          // scopeName ("source.sdbl" — a dependency for highlighting text-query
+          // strings), so the locator must serve it; plus a minimal fallback for
+          // any other unknown scope so the registry never hard-fails.
+          const defs = new Map([[grammarJson.scopeName, { format: "json", content: grammarJson }]]);
+          if (queryJson && queryJson.scopeName) defs.set(queryJson.scopeName, { format: "json", content: queryJson });
+          const registry = new tm.Registry({
+            getGrammarDefinition: async (scopeName) =>
+              defs.get(scopeName) || { format: "json", content: { scopeName, patterns: [], repository: {} } },
+          });
+          const grammar = await registry.loadGrammar(grammarJson.scopeName);
+          if (!grammar) throw new Error("grammar load failed");
           // Monaco 0.52 legacy provider shape: the tokenize result must carry
           // {startIndex, scopes} tokens (most specific TM scope) and an
           // endState that implements equals()/clone(); the adapter then matches
@@ -266,17 +274,28 @@ window.__ModuleLoader__.load({
             clone() { return new TokenizerState(this._ruleStack); }
             equals(other) { return !!(other && other instanceof TokenizerState && other._ruleStack === this._ruleStack); }
           }
-          monaco.languages.setTokensProvider("bsl", {
-            getInitialState: () => new TokenizerState(tm.INITIAL),
-            tokenize: (line, state) => {
-              const r = grammar.tokenizeLine(line, state.ruleStack);
-              return {
-                endState: new TokenizerState(r.ruleStack),
-                tokens: r.tokens.map((t) => ({ startIndex: t.startIndex, scopes: t.scopes[t.scopes.length - 1] })),
-              };
-            },
-          });
-        }
+          return { tm, grammar, TokenizerState };
+        })();
+        // A failed first attempt must not poison the singleton forever —
+        // the next mount (or a transient CDN blip) gets a fresh try.
+        tmStackPromise.catch(() => { tmStackPromise = null; });
+      }
+      return tmStackPromise;
+    }
+
+    async function wireTmGrammar(monaco) {
+      try {
+        const { tm, grammar, TokenizerState } = await getTmStack();
+        monaco.languages.setTokensProvider("bsl", {
+          getInitialState: () => new TokenizerState(tm.INITIAL),
+          tokenize: (line, state) => {
+            const r = grammar.tokenizeLine(line, state.ruleStack);
+            return {
+              endState: new TokenizerState(r.ruleStack),
+              tokens: r.tokens.map((t) => ({ startIndex: t.startIndex, scopes: t.scopes[t.scopes.length - 1] })),
+            };
+          },
+        });
       } catch (e) {
         console.error("[dsh-bsl-editor] tm grammar", e);
       }
@@ -430,32 +449,67 @@ window.__ModuleLoader__.load({
       children: child,
     });
 
-    function EditorView() {
-      const [children, setChildren] = useState(new Map()); // dirPath -> entries[]
-      const [expanded, setExpanded] = useState(new Set()); // expanded dirPaths
-      const [rootPath, setRootPath] = useState(""); // workspace root dir
-      const [openPath, setOpenPath] = useState(null);
-      const [openContent, setOpenContent] = useState("");
-      const [dirty, setDirty] = useState(false);
+    // Editor state survives session switches: DSH remounts the conversation
+    // view under key={sessionId} on every chat switch (component-local state
+    // is destroyed by construction), so each session's UI state lives in a
+    // module-level map keyed by sessionId and is snapshotted on unmount.
+    const defaultPersist = () => ({
+      mode: "files",
+      children: new Map(),      // dirPath -> entries[]
+      expanded: new Set(),      // expanded dirPaths
+      rootPath: "",
+      openPath: null,
+      openContent: "",
+      dirty: false,
+      search: "",
+      highlightPath: null,
+      treeWidth: 280,
+      metaChildren: new Map(),  // nodeKey -> items[]
+      metaExpanded: new Set(),  // expanded nodeKeys
+      metaInfo: null,
+      metaError: "",
+      metaHighlight: null,
+      cursor: null,             // { lineNumber, column } — Monaco position
+      scrollTop: 0,             // Monaco vertical scroll
+      treeScrollTop: 0,         // file/metadata tree vertical scroll
+    });
+    const editorPersistBySession = new Map(); // sessionId -> persist snapshot
+
+    function EditorView(props) {
+      // DSH hands every session-scoped entry its sessionId as a prop; the
+      // persisted state is looked up per session so each chat keeps its own
+      // editor context (file, tree, caret) across switches.
+      const sessionId = props.sessionId;
+      let editorPersist = sessionId ? editorPersistBySession.get(sessionId) : null;
+      if (!editorPersist) {
+        editorPersist = defaultPersist();
+        if (sessionId) editorPersistBySession.set(sessionId, editorPersist);
+      }
+      const [children, setChildren] = useState(() => new Map(editorPersist.children)); // dirPath -> entries[]
+      const [expanded, setExpanded] = useState(() => new Set(editorPersist.expanded)); // expanded dirPaths
+      const [rootPath, setRootPath] = useState(editorPersist.rootPath); // workspace root dir
+      const [openPath, setOpenPath] = useState(editorPersist.openPath);
+      const [openContent, setOpenContent] = useState(editorPersist.openContent);
+      const [dirty, setDirty] = useState(editorPersist.dirty);
       const [saving, setSaving] = useState(false);
       const [saveError, setSaveError] = useState("");
       const [gitFiles, setGitFiles] = useState(new Map());
       const [rootTitle, setRootTitle] = useState("");
       const [treeError, setTreeError] = useState("");
       const [monacoReady, setMonacoReady] = useState(false);
-      const [search, setSearch] = useState("");
+      const [search, setSearch] = useState(editorPersist.search);
       const [searchResults, setSearchResults] = useState([]);
-      const [highlightPath, setHighlightPath] = useState(null);
-      const [treeWidth, setTreeWidth] = useState(280);
+      const [highlightPath, setHighlightPath] = useState(editorPersist.highlightPath);
+      const [treeWidth, setTreeWidth] = useState(editorPersist.treeWidth);
 
       // Metadata-tree mode: "files" (fs tree) | "meta" (1C metadata tree).
-      const [mode, setMode] = useState("files");
-      const [metaChildren, setMetaChildren] = useState(new Map()); // nodeKey -> items[]
-      const [metaExpanded, setMetaExpanded] = useState(new Set()); // expanded nodeKeys
-      const [metaInfo, setMetaInfo] = useState(null); // /bsl/meta/status result
-      const [metaError, setMetaError] = useState("");
+      const [mode, setMode] = useState(editorPersist.mode);
+      const [metaChildren, setMetaChildren] = useState(() => new Map(editorPersist.metaChildren)); // nodeKey -> items[]
+      const [metaExpanded, setMetaExpanded] = useState(() => new Set(editorPersist.metaExpanded)); // expanded nodeKeys
+      const [metaInfo, setMetaInfo] = useState(editorPersist.metaInfo); // /bsl/meta/status result
+      const [metaError, setMetaError] = useState(editorPersist.metaError);
       const [metaLoading, setMetaLoading] = useState(false);
-      const [metaHighlight, setMetaHighlight] = useState(null);
+      const [metaHighlight, setMetaHighlight] = useState(editorPersist.metaHighlight);
       const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
       const [ctxMenu, setCtxMenu] = useState(null); // { x, y, item } — meta-tree context menu
       const [lspReady, setLspReady] = useState(false); // LSP WebSocket connected
@@ -484,6 +538,45 @@ window.__ModuleLoader__.load({
       const f12BoundRef = useRef(null); // editor.addCommand id — bind F12 once
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
       useEffect(() => { openPathRef.current = openPath; }, [openPath]);
+
+      // Mirror the whole UI state into editorPersist so an unmount/remount
+      // (session switch) restores exactly where the user left off.
+      useEffect(() => {
+        editorPersist.mode = mode;
+        editorPersist.children = children;
+        editorPersist.expanded = expanded;
+        editorPersist.rootPath = rootPath;
+        editorPersist.openPath = openPath;
+        // Keep the buffer only when there are unsaved edits — otherwise the
+        // file is re-read from disk on restore, and we don't hold a stale
+        // copy of every visited file in memory.
+        editorPersist.openContent = dirty ? openContent : "";
+        editorPersist.dirty = dirty;
+        editorPersist.search = search;
+        editorPersist.highlightPath = highlightPath;
+        editorPersist.treeWidth = treeWidth;
+        editorPersist.metaChildren = metaChildren;
+        editorPersist.metaExpanded = metaExpanded;
+        editorPersist.metaInfo = metaInfo;
+        editorPersist.metaError = metaError;
+        editorPersist.metaHighlight = metaHighlight;
+      }, [mode, children, expanded, rootPath, openPath, openContent, dirty, search, highlightPath, treeWidth, metaChildren, metaExpanded, metaInfo, metaError, metaHighlight]);
+
+      // Snapshot the Monaco caret + scroll position at unmount time. This
+      // effect's cleanup runs BEFORE the Monaco effect's cleanup (declared
+      // earlier), so the editor instance is still alive when we read it.
+      useEffect(() => {
+        return () => {
+          const ed = editorRef.current;
+          if (ed && typeof ed.isDisposed === "function" && !ed.isDisposed()) {
+            const pos = ed.getPosition();
+            if (pos) editorPersist.cursor = { lineNumber: pos.lineNumber, column: pos.column };
+            editorPersist.scrollTop = ed.getScrollTop() || 0;
+          }
+          const treeBody = treeBodyRef.current;
+          if (treeBody) editorPersist.treeScrollTop = treeBody.scrollTop || 0;
+        };
+      }, []);
 
       // Fetch the workspace title. LSP is intentionally deferred — the editor
       // works as a file browser + Monaco (syntax highlighting) on its own.
@@ -685,7 +778,16 @@ window.__ModuleLoader__.load({
           window.addEventListener("keydown", onGlobalKey, true);
           editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveFileRef.current?.());
 
-          return () => { alive = false; editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
+          // Keep the persisted caret/scroll fresh in real time, not just at
+          // unmount: view switches inside a session (Editor ↔ Chat) tear the
+          // component down through a path where unmount cleanup can be missed,
+          // so the snapshot must already be current when that happens.
+          const scrollSub = editor.onDidScrollChange((e) => { editorPersist.scrollTop = e.scrollTop || 0; });
+          const cursorSub = editor.onDidChangeCursorPosition((e) => {
+            editorPersist.cursor = { lineNumber: e.position.lineNumber, column: e.position.column };
+          });
+
+          return () => { alive = false; scrollSub.dispose(); cursorSub.dispose(); editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
         }).catch((e) => {
           console.error("[dsh-bsl-editor] monaco", e);
           if (alive) setMonacoError(String(e?.message || e));
@@ -1040,7 +1142,79 @@ window.__ModuleLoader__.load({
         return () => disp.dispose();
       }, [monacoReady, openFile]);
 
-      useEffect(() => { loadDir(""); refreshGit(); }, [loadDir, refreshGit]);
+      // Restore the tree scroll position once the tree has rendered (children
+      // come back from editorPersist synchronously, so the first paint already
+      // has the content).
+      const treeScrollRestoredRef = useRef(false);
+      useEffect(() => {
+        if (treeScrollRestoredRef.current) return;
+        const body = treeBodyRef.current;
+        if (!body || body.scrollHeight <= body.clientHeight) {
+          treeScrollRestoredRef.current = true;
+          return;
+        }
+        if (editorPersist.treeScrollTop > 0) body.scrollTop = editorPersist.treeScrollTop;
+        treeScrollRestoredRef.current = true;
+      }, [children, metaChildren]);
+
+      // Load the workspace root on first mount only. On a remount the tree
+      // comes back from editorPersist already populated — refetching the root
+      // would flash "Загрузка…" and collapse nothing, but is still useful to
+      // refresh git badges.
+      const treeRestoredRef = useRef(false);
+      useEffect(() => {
+        refreshGit();
+        if (!treeRestoredRef.current && children.size === 0) {
+          treeRestoredRef.current = true;
+          loadDir(rootPath || "");
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [loadDir, refreshGit]);
+
+      // Restore the previously open file + caret after Monaco is ready.
+      const restoreDoneRef = useRef(false);
+      useEffect(() => {
+        if (!monacoReady || restoreDoneRef.current) return;
+        const p = editorPersist.openPath;
+        if (!p) { restoreDoneRef.current = true; return; }
+        restoreDoneRef.current = true;
+        openFile(p).then(() => {
+          const ed = editorRef.current;
+          if (!ed) return;
+          // Unsaved edits survive the session switch too: the model was
+          // reloaded from disk by openFile, so replay the persisted buffer
+          // (the dirty subscription then re-flags the file automatically).
+          // Must run BEFORE positioning — setValue resets the scroll.
+          if (editorPersist.dirty && modelRef.current && editorPersist.openContent) {
+            const model = modelRef.current;
+            if (model.getValue() !== editorPersist.openContent) {
+              model.setValue(editorPersist.openContent);
+            }
+          }
+          const cur = editorPersist.cursor;
+          if (cur) ed.setPosition(cur);
+          // Monaco computes the layout asynchronously after setModel, and
+          // setPosition/reveal can re-scroll after our first attempt, so
+          // keep re-applying until the editor actually sits at the saved
+          // scrollTop (or give up after a bounded number of tries).
+          const savedScroll = editorPersist.scrollTop;
+          if (savedScroll) {
+            let attempts = 0;
+            const tryApply = () => {
+              const e2 = editorRef.current;
+              if (!e2 || (typeof e2.isDisposed === "function" && e2.isDisposed())) return;
+              if (Math.abs((e2.getScrollTop() || 0) - savedScroll) < 2) return; // already there
+              e2.setScrollTop(savedScroll);
+              attempts += 1;
+              if (attempts < 8) setTimeout(tryApply, 120 + attempts * 60);
+            };
+            requestAnimationFrame(tryApply);
+            // Safety net: if the tab was hidden, rAF never fires — apply on
+            // the next tick instead so the restore isn't lost.
+            setTimeout(tryApply, 250);
+          }
+        });
+      }, [monacoReady, openFile]);
 
       // Debounced search (files: /bsl/search, metadata: /bsl/meta/search).
       useEffect(() => {
@@ -1604,7 +1778,7 @@ window.__ModuleLoader__.load({
             children: "RENDER ERROR: " + (this.state.err?.message || String(this.state.err)) + "\n\n" + (this.state.err?.stack || ""),
           });
         }
-        return jsx(EditorView, {});
+        return jsx(EditorView, this.props);
       }
     }
 
