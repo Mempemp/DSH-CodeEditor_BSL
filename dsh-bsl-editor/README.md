@@ -47,7 +47,7 @@ dsh plugin --profile web add dsh-bsl-editor-0.1.0.tgz
 Либо по прямой ссылке на архив релиза:
 
 ```sh
-dsh plugin --profile web add https://github.com/<ваш-ник>/DSH-CodeEditor/releases/download/v0.1.0/dsh-bsl-editor-0.1.0.tgz
+dsh plugin --profile web add https://github.com/Mempemp/DSH-CodeEditor_BSL/releases/download/v0.1.0/dsh-bsl-editor-0.1.0.tgz
 ```
 
 Затем перезапустите `dsh web` (host-часть) и обновите вкладку браузера (Ctrl+Shift+R).
