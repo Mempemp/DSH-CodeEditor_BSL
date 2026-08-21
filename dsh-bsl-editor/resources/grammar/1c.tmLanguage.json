@@ -119,6 +119,16 @@
         },
         {
           "include": "#miscellaneous"
+        },
+        {
+          "comment": "Метод текущего объекта внутри выражения: ИмяМетода(",
+          "name": "support.function.bsl",
+          "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)\\s*(?=\\())"
+        },
+        {
+          "comment": "Переменная внутри выражения",
+          "name": "variable.bsl",
+          "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)(?=[^\\wа-яё\\.]|$))"
         }
       ]
     },
@@ -141,6 +151,16 @@
         },
         {
           "include": "#miscellaneous"
+        },
+        {
+          "comment": "Метод текущего объекта внутри выражения: ИмяМетода(",
+          "name": "support.function.bsl",
+          "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)\\s*(?=\\())"
+        },
+        {
+          "comment": "Переменная внутри выражения",
+          "name": "variable.bsl",
+          "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)(?=[^\\wа-яё\\.]|$))"
         }
       ]
     },
@@ -224,6 +244,16 @@
       "comment": "Insert end",
       "name": "keyword.other.section.bsl",
       "match": "(?i)#(КонецВставки|EndInsert)"
+    },
+    {
+      "comment": "Метод текущего объекта/функция вне списка: ИмяМетода(",
+      "name": "support.function.bsl",
+      "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)\\s*(?=\\())"
+    },
+    {
+      "comment": "Переменная (идентификатор вне присваивания и вне обращения через точку)",
+      "name": "variable.bsl",
+      "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)(?=[^\\wа-яё\\.]|$))"
     }
   ],
   "repository": {
@@ -389,6 +419,26 @@
           "comment": "Глобальный контекст - Свойства (переменные)",
           "name": "support.variable.bsl",
           "match": "(?x)(?i:(?<=[^\\wа-яё\\.]|^)(\nГлавныйИнтерфейс|MainInterface|\nГлавныйСтиль|MainStyle|\nПараметрЗапуска|LaunchParameter|\nРабочаяДата|WorkingDate|\nХранилищеВариантовОтчетов|ReportsVariantsStorage|\nХранилищеНастроекДанныхФорм|FormDataSettingsStorage|\nХранилищеОбщихНастроек|CommonSettingsStorage|\nХранилищеПользовательскихНастроекДинамическихСписков|DynamicListsUserSettingsStorage|\nХранилищеПользовательскихНастроекОтчетов|ReportsUserSettingsStorage|\nХранилищеСистемныхНастроек|SystemSettingsStorage\n)(?=[^\\wа-яё]|$))"
+        },
+        {
+          "comment": "Обращение к свойству через точку: Переменная.Свойство (первая часть не из глобального контекста)",
+          "match": "(?i:(?<=[^\\wа-яё\\.]|^)([a-zа-яё0-9_]+)(\\.)([a-zа-яё0-9_]+))",
+          "captures": {
+            "1": {
+              "name": "variable.bsl"
+            },
+            "2": {
+              "name": "punctuation.accessor.bsl"
+            },
+            "3": {
+              "name": "variable.other.member.bsl"
+            }
+          }
+        },
+        {
+          "comment": "Свойство/метод после точки, когда первая часть уже распознана (класс, глобальная переменная)",
+          "name": "variable.other.member.bsl",
+          "match": "(?i:(?<=\\.)[a-zа-яё0-9_]+)"
         }
       ]
     },

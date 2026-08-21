@@ -436,6 +436,9 @@ window.__ModuleLoader__.load({
       const [rootPath, setRootPath] = useState(""); // workspace root dir
       const [openPath, setOpenPath] = useState(null);
       const [openContent, setOpenContent] = useState("");
+      const [dirty, setDirty] = useState(false);
+      const [saving, setSaving] = useState(false);
+      const [saveError, setSaveError] = useState("");
       const [gitFiles, setGitFiles] = useState(new Map());
       const [rootTitle, setRootTitle] = useState("");
       const [treeError, setTreeError] = useState("");
@@ -466,6 +469,7 @@ window.__ModuleLoader__.load({
       const editorRef = useRef(null);
       const monacoRef = useRef(null);
       const modelRef = useRef(null);
+      const dirtySubRef = useRef(null); // monaco model onDidChangeContent subscription
       const lspRef = useRef(null);
       const autoRetriesRef = useRef(0); // bounded auto-reconnect counter for LSP
       const containerRef = useRef(null);
@@ -475,6 +479,7 @@ window.__ModuleLoader__.load({
       const draggingRef = useRef(false);
       const rootPathRef = useRef("");
       const openPathRef = useRef("");
+      const mouseInEditorRef = useRef(false);
       const staticNavRef = useRef(null); // { word, targets, index } for F12 cycling
       const f12BoundRef = useRef(null); // editor.addCommand id — bind F12 once
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
@@ -653,7 +658,34 @@ window.__ModuleLoader__.load({
             },
           });
 
-          return () => { alive = false; editor.dispose(); };
+          // Ctrl+A (и другие хоткеи с модификатором): когда мышь над областью
+          // редактора, но фокус в дереве/поиске — отправлять команду в Monaco,
+          // а не в DSH (иначе Ctrl+A выделяет всю страницу).
+          const editorHost = containerRef.current;
+          const onEditorEnter = () => { mouseInEditorRef.current = true; };
+          const onEditorLeave = () => { mouseInEditorRef.current = false; };
+          editorHost.addEventListener("mouseenter", onEditorEnter);
+          editorHost.addEventListener("mouseleave", onEditorLeave);
+          const onGlobalKey = (e) => {
+            if (!mouseInEditorRef.current) return;
+            const k = e.key.toLowerCase();
+            if (!(e.ctrlKey || e.metaKey) || (k !== "a" && k !== "s")) return;
+            if (editorHost.contains(document.activeElement)) return; // фокус уже в Monaco
+            e.preventDefault();
+            e.stopPropagation();
+            if (k === "a") {
+              const ed = editorRef.current;
+              if (!ed) return;
+              ed.focus();
+              ed.trigger("keyboard", "editor.action.selectAll", null);
+            } else {
+              saveFileRef.current?.();
+            }
+          };
+          window.addEventListener("keydown", onGlobalKey, true);
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveFileRef.current?.());
+
+          return () => { alive = false; editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
         }).catch((e) => {
           console.error("[dsh-bsl-editor] monaco", e);
           if (alive) setMonacoError(String(e?.message || e));
@@ -720,6 +752,13 @@ window.__ModuleLoader__.load({
             }
             modelRef.current = model;
             editorRef.current.setModel(model);
+            // Track edits: any content change marks the file dirty. The
+            // subscription is re-attached after setValue so opening a file
+            // never flags it as modified.
+            dirtySubRef.current?.dispose?.();
+            dirtySubRef.current = model.onDidChangeContent(() => setDirty(true));
+            setDirty(false);
+            setSaveError("");
             if (lspRef.current) {
               lspRef.current.notify("textDocument/didOpen", {
                 textDocument: { uri: uri.toString(), languageId: "bsl", version: 1, text: data.content },
@@ -759,6 +798,32 @@ window.__ModuleLoader__.load({
           decorationIdsRef.current = editorRef.current.deltaDecorations(old, decorations);
         } catch {}
       }, []);
+
+      // Persist the open model back to disk via the host /bsl/write route.
+      const saveFile = useCallback(async () => {
+        const model = modelRef.current;
+        const path = openPathRef.current;
+        if (!model || !path) return;
+        if (saving) return;
+        setSaving(true);
+        setSaveError("");
+        try {
+          const res = await fetch("/bsl/write", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path, content: model.getValue() }),
+          });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          setDirty(false);
+          refreshGitDecorations(path);
+        } catch (e) {
+          setSaveError(e?.message || String(e));
+        } finally {
+          setSaving(false);
+        }
+      }, [saving, refreshGitDecorations]);
+      const saveFileRef = useRef(null);
+      saveFileRef.current = saveFile;
 
       // LSP feature wiring: once Monaco exists AND the LSP client is connected,
       // register diagnostics/completion/hover/definition/formatting and sync
@@ -1091,33 +1156,53 @@ window.__ModuleLoader__.load({
       const META_FORMAT_LABEL = { edt: "EDT", xml: "XML-выгрузка", object: "пообъектная выгрузка" };
 
       // Scroll the highlighted row into view once it renders (after expand).
+      // Only when the row is actually outside the visible area — a plain
+      // click on an already-visible file must not yank the viewport.
+      const highlightScrollRef = useRef(null);
       useEffect(() => {
-        if (!highlightPath) return;
-        const list = treeBodyRef.current?.querySelectorAll("[data-path]");
-        if (!list) return;
+        if (!highlightPath || highlightPath === highlightScrollRef.current) return;
+        const body = treeBodyRef.current;
+        if (!body) return;
+        const list = body.querySelectorAll("[data-path]");
+        let found = false;
         for (const el of list) {
           if (el.dataset.path === highlightPath) {
-            el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+            const elRect = el.getBoundingClientRect();
+            const bodyRect = body.getBoundingClientRect();
+            const above = elRect.top < bodyRect.top;
+            const below = elRect.bottom > bodyRect.bottom;
+            if (above || below) {
+              body.scrollTo({ top: body.scrollTop + (elRect.top - bodyRect.top), behavior: "smooth" });
+            }
+            found = true;
             break;
           }
         }
+        if (found) highlightScrollRef.current = highlightPath;
       }, [highlightPath, expanded, children, search]);
 
       // Same for metadata-mode highlight — scroll ONLY when the highlighted
       // node changes (not on every expand/collapse, which made the view
-      // "jump back" to a stale highlight).
+      // "jump back" to a stale highlight), and only when the node is outside
+      // the visible area (a plain click on a visible row must not yank).
       const metaScrollRef = useRef(null);
       useEffect(() => {
         if (!metaHighlight || metaHighlight === metaScrollRef.current) return;
-        const list = treeBodyRef.current?.querySelectorAll("[data-meta-path]");
+        const body = treeBodyRef.current;
+        if (!body) return;
+        const list = body.querySelectorAll("[data-meta-path]");
         let found = false;
-        if (list) {
-          for (const el of list) {
-            if (el.dataset.metaPath === metaHighlight) {
-              el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-              found = true;
-              break;
+        for (const el of list) {
+          if (el.dataset.metaPath === metaHighlight) {
+            const elRect = el.getBoundingClientRect();
+            const bodyRect = body.getBoundingClientRect();
+            const above = elRect.top < bodyRect.top;
+            const below = elRect.bottom > bodyRect.bottom;
+            if (above || below) {
+              body.scrollTo({ top: body.scrollTop + (elRect.top - bodyRect.top), behavior: "smooth" });
             }
+            found = true;
+            break;
           }
         }
         // Only mark as scrolled when the row actually rendered — otherwise
@@ -1180,7 +1265,11 @@ window.__ModuleLoader__.load({
               jsx("div", {
                 className: "dsh-bsl-row",
                 "data-path": full,
-                onClick: () => (isDir ? toggle(full) : openFile(full)),
+                onClick: () => {
+                  setHighlightPath(full);
+                  if (isDir) toggle(full);
+                  else openFile(full);
+                },
                 style: {
                   boxSizing: "border-box",
                   width: "100%",
@@ -1366,7 +1455,7 @@ window.__ModuleLoader__.load({
         // Status bar — top strip, in flow, visible in both files and metadata
         // modes. Click retries a failed LSP connection; settings live in
         // DSH Settings → «1С-редактор».
-        jsx("div", {
+        jsxs("div", {
           onClick: () => { if (!lspReady) setLspAttempt((n) => n + 1); },
           title: lspReady ? "bsl-language-server подключён" : lspError ? "Нажмите, чтобы повторить подключение (настройки: Settings → 1С-редактор)" : "Запуск bsl-language-server…",
           style: {
@@ -1385,7 +1474,32 @@ window.__ModuleLoader__.load({
             overflow: "hidden",
             textOverflow: "ellipsis",
           },
-          children: cfg && !cfg.lspEnabled ? "LSP выключен в настройках" : lspReady ? "● LSP готов" : lspError ? "✕ LSP: " + lspError + " — нажмите для повтора" : "○ LSP подключение…",
+          children: [
+            cfg && !cfg.lspEnabled ? "LSP выключен в настройках" : lspReady ? "● LSP готов" : lspError ? "✕ LSP: " + lspError + " — нажмите для повтора" : "○ LSP подключение…",
+            openPath
+              ? jsxs("div", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, minWidth: 0, color: "var(--dsw-alias-label-secondary, #8a94a6)" }, children: [
+                  dirty ? jsx("span", { title: "Файл изменён — не сохранён", style: { color: "#ffb300", flexShrink: 0 }, children: "●" }) : null,
+                  jsx("span", { style: { overflow: "hidden", textOverflow: "ellipsis", direction: "rtl", textAlign: "left" }, children: openPath.split(/[\\/]/).pop() }),
+                  saveError ? jsx("span", { style: { color: "#f44336", flexShrink: 0 }, children: "✕" }) : null,
+                  jsx("button", {
+                    onClick: (e) => { e.stopPropagation(); saveFileRef.current?.(); },
+                    title: saving ? "Сохранение…" : dirty ? "Сохранить (Ctrl+S)" : "Сохранено",
+                    disabled: saving,
+                    style: {
+                      flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                      width: 20, height: 20, border: "none", borderRadius: 6, cursor: saving ? "wait" : "pointer",
+                      background: "transparent", color: dirty ? "var(--dsw-alias-state-business-primary, #4a9eff)" : "#8a94a6",
+                      padding: 0,
+                    },
+                    children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                      jsx("path", { d: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" }),
+                      jsx("polyline", { points: "17 21 17 13 7 13 7 21" }),
+                      jsx("polyline", { points: "7 3 7 8 15 8" }),
+                    ] }),
+                  }),
+                ] })
+              : null,
+          ],
         }),
         jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
           jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [

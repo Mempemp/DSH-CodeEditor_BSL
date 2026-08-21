@@ -291,6 +291,38 @@ function runGit(root, args) {
   return { ok: true, output: r.stdout ?? "" };
 }
 
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => {
+      data += c;
+      if (data.length > 16 * 1024 * 1024) {
+        reject(new Error("body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+async function handleWrite(root, req, res) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const path = String(body.path || "");
+    const content = String(body.content ?? "");
+    const abs = await resolveInside(root, path);
+    const st = await fs.stat(abs).catch(() => null);
+    if (st && st.isDirectory()) return json(res, 400, { error: "is a directory" });
+    const ext = abs.slice(abs.lastIndexOf(".")).toLowerCase();
+    if (!TEXT_EXTENSIONS.has(ext)) return json(res, 400, { error: "not a text file" });
+    await fs.writeFile(abs, content, "utf-8");
+    json(res, 200, { ok: true, path: abs });
+  } catch (e) {
+    json(res, 400, { error: e.message });
+  }
+}
+
 async function handleGitStatus(root, res) {
   const r = runGit(root, ["status", "--porcelain", "-z"]);
   if (!r.ok) return json(res, 200, { ok: false, files: [] });
@@ -554,6 +586,10 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/read",
     handler: (req, res) => handleRead(root, new URL(req.url, "http://x"), res, config),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/write",
+    handler: (req, res) => handleWrite(root, req, res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-status",
