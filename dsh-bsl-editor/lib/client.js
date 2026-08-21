@@ -679,26 +679,37 @@ window.__ModuleLoader__.load({
               base: "vs-dark",
               inherit: true,
               rules: [
-                { token: "keyword", foreground: "569CD6" },
-                { token: "keyword.operator", foreground: "D4D4D4" },
-                { token: "keyword.other.preprocessor", foreground: "C586C0" },
-                { token: "storage.type", foreground: "569CD6" },
-                { token: "storage.modifier", foreground: "C586C0" },
-                { token: "support.function", foreground: "DCDCAA" },
-                { token: "support.class", foreground: "4EC9B0" },
-                { token: "entity.name.function", foreground: "DCDCAA" },
-                { token: "entity.name.section", foreground: "DCDCAA" },
-                { token: "string.quoted.double", foreground: "CE9178" },
-                { token: "constant.numeric", foreground: "B5CEA8" },
-                { token: "constant.language", foreground: "569CD6" },
-                { token: "comment", foreground: "6A9955", fontStyle: "italic" },
-                { token: "variable", foreground: "9CDCFE" },
-                { token: "invalid", foreground: "F48771" },
+                { token: "keyword", foreground: "F92672" },
+                { token: "keyword.operator", foreground: "F92672" },
+                { token: "keyword.other.preprocessor", foreground: "F92672" },
+                { token: "storage.type", foreground: "66D9EF", fontStyle: "italic" },
+                { token: "storage.modifier", foreground: "F92672" },
+                { token: "support.function", foreground: "66D9EF" },
+                { token: "support.class", foreground: "66D9EF" },
+                { token: "entity.name.function", foreground: "A6E22E" },
+                { token: "entity.name.section", foreground: "A6E22E" },
+                { token: "string.quoted.double", foreground: "E6DB74" },
+                { token: "constant.numeric", foreground: "AE81FF" },
+                { token: "constant.language", foreground: "AE81FF" },
+                { token: "comment", foreground: "88846F", fontStyle: "italic" },
+                { token: "variable", foreground: "F8F8F2" },
+                { token: "invalid", foreground: "F44747" },
               ],
-              // monaco 0.52+ reads themeData.colors directly in the tokenTheme
-              // getter — the field must exist even when inheriting everything
-              // from the base theme (missing colors = crash on editor.create).
-              colors: {},
+              // Monokai (VS Code theme-monokai) editor surface colors. The
+              // field must exist even when inheriting everything from the base
+              // theme (missing colors = crash on editor.create in 0.52+).
+              colors: {
+                "editor.background": "#272822",
+                "editor.foreground": "#F8F8F2",
+                "editorLineNumber.foreground": "#90908A",
+                "editorCursor.foreground": "#F8F8F0",
+                "editor.selectionBackground": "#878B9180",
+                "editor.lineHighlightBackground": "#3E3D32",
+                "editorWhitespace.foreground": "#464741",
+                "editorIndentGuide.background": "#464741",
+                "editorIndentGuide.activeBackground": "#767771",
+                "editorGutter.background": "#272822",
+              },
             });
           } catch {}
           const composerClearance = (() => {
