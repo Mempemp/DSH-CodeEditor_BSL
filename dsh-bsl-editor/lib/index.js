@@ -29,6 +29,8 @@ export const Config = z.object({
   sourceExtensions: z.array(z.string()).default([".bsl", ".os"]),
   /** LSP master switch; off by default — unstable on large configurations. */
   lspEnabled: z.boolean().default(false),
+  /** Include git-untracked files in the «Изменённые» tree filter. */
+  showUntracked: z.boolean().default(false),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -323,8 +325,9 @@ async function handleWrite(root, req, res) {
   }
 }
 
-async function handleGitStatus(root, res) {
-  const r = runGit(root, ["status", "--porcelain", "-z"]);
+async function handleGitStatus(root, res, config) {
+  // Untracked entries ("?? path") are opt-in: most of the time they are noise.
+  const r = runGit(root, ["status", "--porcelain", "-z", ...(config?.showUntracked ? [] : ["--untracked-files=no"])]);
   if (!r.ok) return json(res, 200, { ok: false, files: [] });
   const files = r.output.split("\0").filter(Boolean).map((line) => {
     const status = line.slice(0, 2).trim();
@@ -541,6 +544,7 @@ export function apply(ctx, config) {
     kind: "exact", path: "/bsl/config",
     handler: (_req, res) => json(res, 200, {
       lspEnabled: config.lspEnabled,
+      showUntracked: config.showUntracked !== false,
       serverPort: config.serverPort,
       serverBin: config.serverBin,
       workspaceDir: config.workspaceDir,
@@ -557,6 +561,7 @@ export function apply(ctx, config) {
           const patch = JSON.parse(body || "{}");
           const next = {
             lspEnabled: patch.lspEnabled ?? config.lspEnabled,
+            showUntracked: patch.showUntracked ?? (config.showUntracked !== false),
             serverPort: patch.serverPort ?? config.serverPort,
             serverBin: patch.serverBin ?? config.serverBin,
             sourceExtensions: patch.sourceExtensions ?? config.sourceExtensions,
@@ -593,7 +598,7 @@ export function apply(ctx, config) {
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-status",
-    handler: (_req, res) => handleGitStatus(root, res),
+    handler: (_req, res) => handleGitStatus(root, res, config),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-diff",

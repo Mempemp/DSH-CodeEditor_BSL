@@ -220,9 +220,15 @@ window.__ModuleLoader__.load({
     // the first wireTmGrammar call loads it, later calls reuse the loaded
     // grammar and only re-register the tokens provider on the new Monaco.
     let tmStackPromise = null;
-    function getTmStack() {
-      if (!tmStackPromise) {
-        tmStackPromise = (async () => {
+    // onigasm's loadWASM is strictly once per page: its ESM module is cached
+    // by the browser, so a RETRY after a partial failure would hit an already
+    // initialized instance and throw "subsequent calls are not allowed",
+    // poisoning every later mount. Keep this promise forever — only the
+    // grammar/registry half of the stack is allowed to retry.
+    let onigasmReadyPromise = null;
+    function getOnigasmReady() {
+      if (!onigasmReadyPromise) {
+        onigasmReadyPromise = (async () => {
           // monaco-textmate@3 uses onigasm INTERNALLY from a fixed jsdelivr URL
           // — its WASM must be initialized through that exact module instance,
           // so no CDN fallback for the module itself.
@@ -238,7 +244,25 @@ window.__ModuleLoader__.load({
             } catch {}
           }
           if (!wasm) throw new Error("onigasm.wasm недоступен");
-          await onigasm.loadWASM(wasm);
+          try {
+            await onigasm.loadWASM(wasm);
+          } catch (e) {
+            // Already initialized by a previous page-lifetime attempt — fine.
+            if (!/subsequent calls|already/i.test(String(e?.message || e))) throw e;
+          }
+          return onigasm;
+        })();
+        // A failed attempt (wasm not reachable yet) may be retried later:
+        // since "subsequent calls" is swallowed above, a retry can only hit
+        // an uninitialized instance — safe to loadWASM again.
+        onigasmReadyPromise.catch(() => { onigasmReadyPromise = null; });
+      }
+      return onigasmReadyPromise;
+    }
+    function getTmStack() {
+      if (!tmStackPromise) {
+        tmStackPromise = (async () => {
+          const onigasm = await getOnigasmReady();
           let tm;
           try {
             tm = await import("https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm");
@@ -464,6 +488,9 @@ window.__ModuleLoader__.load({
       search: "",
       highlightPath: null,
       treeWidth: 280,
+      gitFilter: null,          // null | "*" — null = все файлы, "*" = только изменённые
+      tabs: [],                 // открытые вкладки (absolute paths, в порядке открытия)
+      openBuffers: new Map(),   // path -> unsaved content (для табов с правками)
       metaChildren: new Map(),  // nodeKey -> items[]
       metaExpanded: new Set(),  // expanded nodeKeys
       metaInfo: null,
@@ -501,6 +528,8 @@ window.__ModuleLoader__.load({
       const [searchResults, setSearchResults] = useState([]);
       const [highlightPath, setHighlightPath] = useState(editorPersist.highlightPath);
       const [treeWidth, setTreeWidth] = useState(editorPersist.treeWidth);
+      const [gitFilter, setGitFilter] = useState(editorPersist.gitFilter);
+      const [tabs, setTabs] = useState(editorPersist.tabs);
 
       // Metadata-tree mode: "files" (fs tree) | "meta" (1C metadata tree).
       const [mode, setMode] = useState(editorPersist.mode);
@@ -532,12 +561,14 @@ window.__ModuleLoader__.load({
       const treeBodyRef = useRef(null);
       const draggingRef = useRef(false);
       const rootPathRef = useRef("");
-      const openPathRef = useRef("");
+      const openPathRef = useRef(editorPersist.openPath || "");
       const mouseInEditorRef = useRef(false);
       const staticNavRef = useRef(null); // { word, targets, index } for F12 cycling
       const f12BoundRef = useRef(null); // editor.addCommand id — bind F12 once
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
       useEffect(() => { openPathRef.current = openPath; }, [openPath]);
+      const dirtyRef = useRef(false);
+      useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
 
       // Mirror the whole UI state into editorPersist so an unmount/remount
       // (session switch) restores exactly where the user left off.
@@ -555,12 +586,16 @@ window.__ModuleLoader__.load({
         editorPersist.search = search;
         editorPersist.highlightPath = highlightPath;
         editorPersist.treeWidth = treeWidth;
+        editorPersist.gitFilter = gitFilter;
+        // Tabs + per-tab dirty buffers survive session switches.
+        editorPersist.tabs = tabs;
+        editorPersist.openBuffers = openBuffersRef.current;
         editorPersist.metaChildren = metaChildren;
         editorPersist.metaExpanded = metaExpanded;
         editorPersist.metaInfo = metaInfo;
         editorPersist.metaError = metaError;
         editorPersist.metaHighlight = metaHighlight;
-      }, [mode, children, expanded, rootPath, openPath, openContent, dirty, search, highlightPath, treeWidth, metaChildren, metaExpanded, metaInfo, metaError, metaHighlight]);
+      }, [mode, children, expanded, rootPath, openPath, openContent, dirty, search, highlightPath, treeWidth, gitFilter, metaChildren, metaExpanded, metaInfo, metaError, metaHighlight]);
 
       // Snapshot the Monaco caret + scroll position at unmount time. This
       // effect's cleanup runs BEFORE the Monaco effect's cleanup (declared
@@ -846,43 +881,140 @@ window.__ModuleLoader__.load({
         } catch {}
       }, []);
 
-      const openFile = useCallback(async (fullPath) => {
+      // ── Tabs: multiple open files, per-tab unsaved buffers ──────────────
+      // Monaco models hold each file's content (and unsaved edits) under a
+      // stable URI, so switching tabs is just editor.setModel() — buffers
+      // survive both tab switches and session switches. openBuffersRef
+      // mirrors which tabs are dirty and keeps their text for persistence.
+      const openBuffersRef = useRef(editorPersist.openBuffers instanceof Map ? editorPersist.openBuffers : new Map()); // path -> unsaved content
+      const [tabDirty, setTabDirty] = useState(() => new Set(openBuffersRef.current.keys()));
+      const markTabDirty = useCallback((path, isDirty, content) => {
+        if (isDirty) openBuffersRef.current.set(path, content);
+        else openBuffersRef.current.delete(path);
+        setTabDirty((prev) => { const s = new Set(prev); isDirty ? s.add(path) : s.delete(path); return s; });
+      }, []);
+      // Tabs are keyed by a canonical absolute path: forward slashes, drive
+      // letter upper-cased. The same file reached via tree (backslashes),
+      // search results or the git list must land on ONE tab, and `openPath`
+      // (the server's normalized path) must equal that key for highlighting.
+      const normPath = (p) => {
+        let s = String(p || "").replace(/\\/g, "/");
+        if (/^[a-z]:/.test(s)) s = s[0].toUpperCase() + s.slice(1);
+        return s;
+      };
+      const addTab = useCallback((raw) => {
+        const path = normPath(raw);
+        setTabs((prev) => prev.includes(path) ? prev : [...prev, path]);
+        return path;
+      }, []);
+
+      // Per-tab Monaco view state (scroll + cursor): saved on leave, restored
+      // on return — switching tabs must feel like switching browser tabs.
+      const viewStatesRef = useRef(new Map()); // normPath -> monaco view state
+
+      const openFile = useCallback(async (rawPath) => {
+        // Canonical form up front: every consumer (tabs, refs, dirty map)
+        // works with one spelling of the path.
+        const fullPath = normPath(rawPath);
+        // Drive ALL consumers (tab highlight, refs, view-state keys) from this
+        // one value — it must update on every switch, not only on first open.
+        setOpenPath(fullPath);
         setEditorNotice(null);
         try {
-          const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
-          setOpenPath(data.path);
-          setOpenContent(data.content);
-          if (editorRef.current && monacoRef.current) {
-            const monaco = monacoRef.current;
-            const uri = monaco.Uri.parse("file:///" + data.path.replace(/\\/g, "/"));
-            const lang = langFor(data.path);
-            let model = monaco.editor.getModel(uri);
-            if (!model) model = monaco.editor.createModel(data.content, lang, uri);
-            else monaco.editor.setModelLanguage(model, lang);
-            if (model.getValue() !== data.content) model.setValue(data.content);
-            if (modelRef.current && modelRef.current !== model) {
-              modelRef.current.dispose?.();
-            }
-            modelRef.current = model;
-            editorRef.current.setModel(model);
-            // Track edits: any content change marks the file dirty. The
-            // subscription is re-attached after setValue so opening a file
-            // never flags it as modified.
-            dirtySubRef.current?.dispose?.();
-            dirtySubRef.current = model.onDidChangeContent(() => setDirty(true));
-            setDirty(false);
-            setSaveError("");
-            if (lspRef.current) {
-              lspRef.current.notify("textDocument/didOpen", {
-                textDocument: { uri: uri.toString(), languageId: "bsl", version: 1, text: data.content },
-              });
-            }
-            refreshGitDecorations(data.path);
+          addTab(fullPath);
+          const monaco = monacoRef.current;
+          const ed = editorRef.current;
+          if (!monaco || !ed) return;
+          // Remember where the outgoing tab was scrolled / positioned.
+          if (openPathRef.current && modelRef.current) {
+            viewStatesRef.current.set(openPathRef.current, ed.saveViewState());
           }
+          const uri = monaco.Uri.parse("file:///" + fullPath.replace(/\\/g, "/"));
+          let model = monaco.editor.getModel(uri);
+          if (!model) {
+            // First open in this page: parked unsaved text wins over disk
+            // (covers tabs other than the active one after a session switch).
+            const parked = openBuffersRef.current.get(fullPath);
+            const lang = langFor(fullPath);
+            if (parked != null) {
+              model = monaco.editor.createModel(parked, lang, uri);
+              setOpenContent(parked);
+            } else {
+              const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
+              model = monaco.editor.createModel(data.content, lang, uri);
+              setOpenContent(data.content);
+              if (lspRef.current) {
+                lspRef.current.notify("textDocument/didOpen", {
+                  textDocument: { uri: uri.toString(), languageId: "bsl", version: 1, text: data.content },
+                });
+              }
+            }
+          } else {
+            setOpenContent(model.getValue());
+          }
+          modelRef.current = model;
+          ed.setModel(model);
+          const st = viewStatesRef.current.get(fullPath);
+          if (st) {
+            // Apply after Monaco recomputes layout for the new model —
+            // a synchronous restore gets overwritten and scroll resets.
+            requestAnimationFrame(() => {
+              const e2 = editorRef.current;
+              if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+            });
+          }
+          // Track edits: park the text on EVERY change (tree clicks call
+          // openFile directly, bypassing switchTab, so the buffer must always
+          // be current for the tab system to be lossless).
+          dirtySubRef.current?.dispose?.();
+          dirtySubRef.current = model.onDidChangeContent(() => {
+            setDirty(true);
+            markTabDirty(fullPath, true, model.getValue());
+            // Keep the persist mirror current so session switches replay
+            // the latest text, not the on-disk snapshot.
+            setOpenContent(model.getValue());
+          });
+          setDirty(openBuffersRef.current.has(fullPath));
+          setSaveError("");
+          refreshGitDecorations(fullPath);
         } catch (e) {
           console.error("[dsh-bsl-editor] open", e);
         }
       }, []);
+
+      const switchTab = useCallback(async (path) => {
+        const p = normPath(path);
+        if (p === openPathRef.current) return;
+        await openFile(p);
+        setHighlightPath(p);
+      }, [openFile]);
+      const closeTab = useCallback(async (path) => {
+        const rest = tabs.filter((p) => p !== path);
+        setTabs(rest);
+        openBuffersRef.current.delete(path);
+        setTabDirty((prev) => { const s = new Set(prev); s.delete(path); return s; });
+        viewStatesRef.current.delete(path);
+        // Free the closed file's Monaco model (its buffer is no longer needed).
+        try {
+          const monaco = monacoRef.current;
+          if (monaco) {
+            const uri = monaco.Uri.parse("file:///" + path.replace(/\\/g, "/"));
+            monaco.editor.getModel(uri)?.dispose?.();
+          }
+        } catch {}
+        if (path === openPathRef.current) {
+          const next = rest[rest.length - 1] || null;
+          if (next) await openFile(next);
+          else {
+            setOpenPath(null);
+            openPathRef.current = null;
+            if (editorRef.current) editorRef.current.setModel(null);
+            modelRef.current = null;
+            setEditorNotice("Выберите файл из дерева");
+            setHighlightPath(null);
+          }
+        }
+      }, [tabs, openFile]);
 
       const refreshGitDecorations = useCallback(async (path) => {
         if (!editorRef.current || !monacoRef.current) return;
@@ -928,6 +1060,7 @@ window.__ModuleLoader__.load({
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           setDirty(false);
+          markTabDirty(path, false);
           refreshGitDecorations(path);
         } catch (e) {
           setSaveError(e?.message || String(e));
@@ -937,6 +1070,38 @@ window.__ModuleLoader__.load({
       }, [saving, refreshGitDecorations]);
       const saveFileRef = useRef(null);
       saveFileRef.current = saveFile;
+
+      // Revert the active file: re-read from disk, drop unsaved edits and the
+      // parked buffer, refresh git decorations. Keeps scroll position.
+      const revertFile = useCallback(async () => {
+        const path = openPathRef.current;
+        const model = modelRef.current;
+        if (!path || !model) return;
+        try {
+          const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(path));
+          if (model.getValue() !== data.content) {
+            // Preserve the view across the buffer swap.
+            const ed = editorRef.current;
+            const st = ed?.saveViewState?.();
+            model.setValue(data.content);
+            if (ed && st) {
+              requestAnimationFrame(() => {
+                const e2 = editorRef.current;
+                if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+              });
+            }
+          }
+          setOpenContent(data.content);
+          markTabDirty(path, false);
+          setDirty(false);
+          setSaveError("");
+          refreshGitDecorations(path);
+        } catch (e) {
+          setSaveError(e?.message || String(e));
+        }
+      }, [markTabDirty, refreshGitDecorations]);
+      const revertFileRef = useRef(null);
+      revertFileRef.current = revertFile;
 
       // LSP feature wiring: once Monaco exists AND the LSP client is connected,
       // register diagnostics/completion/hover/definition/formatting and sync
@@ -1174,6 +1339,8 @@ window.__ModuleLoader__.load({
       // refresh git badges.
       const treeRestoredRef = useRef(false);
       useEffect(() => {
+        // Config arrives async and may have just changed (Settings → save):
+        // refetch git statuses so untracked visibility follows immediately.
         refreshGit();
         if (!treeRestoredRef.current && children.size === 0) {
           treeRestoredRef.current = true;
@@ -1181,6 +1348,9 @@ window.__ModuleLoader__.load({
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [loadDir, refreshGit]);
+      useEffect(() => {
+        if (cfg) refreshGit();
+      }, [cfg?.showUntracked, cfg?.lspEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
 
       // Restore the previously open file + caret after Monaco is ready.
       const restoreDoneRef = useRef(false);
@@ -1192,16 +1362,12 @@ window.__ModuleLoader__.load({
         openFile(p).then(() => {
           const ed = editorRef.current;
           if (!ed) return;
-          // Unsaved edits survive the session switch too: the model was
-          // reloaded from disk by openFile, so replay the persisted buffer
-          // (the dirty subscription then re-flags the file automatically).
-          // Must run BEFORE positioning — setValue resets the scroll.
-          if (editorPersist.dirty && modelRef.current && editorPersist.openContent) {
-            const model = modelRef.current;
-            if (model.getValue() !== editorPersist.openContent) {
-              model.setValue(editorPersist.openContent);
-            }
-          }
+          // Unsaved edits already live in the Monaco model (openFile seeds it
+          // from the parked buffer), so only the caret/scroll need replaying.
+          // Monaco computes the layout asynchronously after setModel, and
+          // setPosition/reveal can re-scroll after our first attempt, so
+          // keep re-applying until the editor actually sits at the saved
+          // scrollTop (or give up after a bounded number of tries).
           const cur = editorPersist.cursor;
           if (cur) ed.setPosition(cur);
           // Monaco computes the layout asynchronously after setModel, and
@@ -1450,6 +1616,7 @@ window.__ModuleLoader__.load({
               jsx("div", {
                 className: "dsh-bsl-row",
                 "data-path": full,
+                title: full,
                 onClick: () => {
                   setHighlightPath(full);
                   if (isDir) toggle(full);
@@ -1517,6 +1684,7 @@ window.__ModuleLoader__.load({
           return jsxs("div", {
             key: r.path,
             className: "dsh-bsl-row",
+            title: r.path,
             onClick: () => (isDir ? reveal(r.path) : openFile(r.path)),
             style: {
               boxSizing: "border-box", width: "100%", maxWidth: "100%", height: 34,
@@ -1531,6 +1699,76 @@ window.__ModuleLoader__.load({
                 : iconBox(coloredFile(r.name)),
               jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: r.name }),
               jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap" }, children: r.rel }),
+            ],
+          });
+        });
+      };
+
+      // Git-status filter chips: null = all files, otherwise show only files
+      // with that status (M/A/??/D) as a flat list built from gitFiles.
+      const gitFilterChips = [
+        { key: null, label: "Все файлы" },
+        { key: "*", label: "Изменённые" },
+      ];
+      const gitStatusColor = (st) => st === "M" ? "#e2c08d" : st === "A" ? "#4caf50" : st === "D" ? "#f44336" : "#8a94a6";
+      // "*" matches any porcelain status (incl. combined "AM"/"A?" forms).
+      const statusMatches = (st, f) => f === "*" ? !!st : f === "??" ? st.includes("?") : st.split("").some((ch) => ch === f);
+      const renderGitFilter = () => mode !== "files" ? null : jsxs("div", {
+        style: { display: "flex", gap: 4, padding: "0 4px 8px" },
+        children: gitFilterChips.map((c) => jsx("button", {
+          onClick: () => { setGitFilter(c.key); setEditorNotice(null); if (c.key) refreshGit(); },
+          style: {
+            flex: 1,
+            height: 22,
+            padding: "0 10px",
+            border: "none",
+            borderRadius: 8,
+            cursor: "pointer",
+            font: "var(--dsw-font-s-14)",
+            color: "var(--dsw-alias-label-primary)",
+            background: gitFilter === c.key ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
+            opacity: gitFilter === c.key ? 1 : 0.6,
+          },
+          children: c.label,
+        })),
+      });
+      const relOf = (fullPath) => {
+        let rel = fullPath.replace(/\\/g, "/");
+        const r = (rootPath || "").replace(/\\/g, "/");
+        if (r && rel.toLowerCase().startsWith(r.toLowerCase())) rel = rel.slice(r.length).replace(/^\/+/, "");
+        return rel;
+      };
+      const renderGitList = () => {
+        if (!gitFiles.size) {
+          return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6 }, children: "Нет изменённых файлов" });
+        }
+        const rows = [...gitFiles.entries()]
+          .filter(([rel, st]) => statusMatches(st, gitFilter))
+          .sort((a, b) => a[0].localeCompare(b[0]));
+        if (!rows.length) {
+          return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6 }, children: "Нет изменённых файлов" });
+        }
+        return rows.map(([rel, st]) => {
+          const full = rootPath ? joinPath(rootPath, rel) : rel;
+          const deleted = st.includes("D");
+          const name = rel.slice(rel.lastIndexOf("/") + 1);
+          return jsxs("div", {
+            className: "dsh-bsl-row",
+            onClick: () => (deleted ? setEditorNotice("Файл удалён из рабочего дерева: " + rel) : openFile(full)),
+            title: full + (deleted ? " (удалён)" : "") + "  ·  " + st,
+            style: {
+              boxSizing: "border-box", width: "100%", maxWidth: "100%", height: 34,
+              font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
+              textAlign: "left", cursor: "pointer", whiteSpace: "nowrap",
+              borderRadius: 8, alignItems: "center", gap: 6, padding: "0 8px",
+              display: "flex",
+              opacity: deleted ? 0.55 : 1,
+            },
+            children: [
+              iconBox(coloredFile(name)),
+              jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: name }),
+              jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }, children: rel }),
+              jsx("span", { style: { flexShrink: 0, color: gitStatusColor(st), fontSize: 11, width: 18, textAlign: "right" }, children: st }),
             ],
           });
         });
@@ -1637,53 +1875,101 @@ window.__ModuleLoader__.load({
       };
 
       return jsxs("div", { ref: rootRef, "data-conversation-composer-overlay": "", style: { position: "relative", display: "flex", flexDirection: "column", height: "100%", minHeight: 0, minWidth: 0, width: "100%", background: "var(--dsw-alias-bg-base)", overflow: "hidden" }, children: [
-        // Status bar — top strip, in flow, visible in both files and metadata
-        // modes. Click retries a failed LSP connection; settings live in
-        // DSH Settings → «1С-редактор».
-        jsxs("div", {
-          onClick: () => { if (!lspReady) setLspAttempt((n) => n + 1); },
-          title: lspReady ? "bsl-language-server подключён" : lspError ? "Нажмите, чтобы повторить подключение (настройки: Settings → 1С-редактор)" : "Запуск bsl-language-server…",
+        // Tab bar — replaces the old LSP status strip: one tab per open file,
+        // unsaved-dot + close button per tab, global save button on the right.
+        // LSP status moved to title tooltips (Settings → 1С-редактор).
+        jsx("div", {
           style: {
             flexShrink: 0,
             display: "flex",
             alignItems: "center",
-            gap: 8,
-            height: 24,
-            padding: "0 12px",
+            gap: 4,
+            height: 28,
+            padding: "0 8px",
             fontSize: 11,
-            color: cfg && !cfg.lspEnabled ? "#8a8a8a" : lspReady ? "#4caf50" : lspError ? "#f44336" : "#ffb300",
+            color: "var(--dsw-alias-label-secondary, #8a94a6)",
             background: "var(--dsw-alias-bg-layer-2)",
             borderBottom: "1px solid var(--dsw-alias-border-l2)",
-            cursor: lspReady ? "default" : "pointer",
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
+            overflowX: "auto",
+            overflowY: "hidden",
+            scrollbarWidth: "thin",
           },
           children: [
-            cfg && !cfg.lspEnabled ? "LSP выключен в настройках" : lspReady ? "● LSP готов" : lspError ? "✕ LSP: " + lspError + " — нажмите для повтора" : "○ LSP подключение…",
-            openPath
-              ? jsxs("div", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, minWidth: 0, color: "var(--dsw-alias-label-secondary, #8a94a6)" }, children: [
-                  dirty ? jsx("span", { title: "Файл изменён — не сохранён", style: { color: "#ffb300", flexShrink: 0 }, children: "●" }) : null,
-                  jsx("span", { style: { overflow: "hidden", textOverflow: "ellipsis", direction: "rtl", textAlign: "left" }, children: openPath.split(/[\\/]/).pop() }),
-                  saveError ? jsx("span", { style: { color: "#f44336", flexShrink: 0 }, children: "✕" }) : null,
-                  jsx("button", {
-                    onClick: (e) => { e.stopPropagation(); saveFileRef.current?.(); },
-                    title: saving ? "Сохранение…" : dirty ? "Сохранить (Ctrl+S)" : "Сохранено",
-                    disabled: saving,
+            tabs.length === 0 ? jsx("span", { style: { opacity: 0.5, padding: "0 6px" }, children: "Нет открытых файлов" }) : null,
+            tabs.map((p) => {
+              const isTabDirty = tabDirty.has(p);
+              const active = p === openPath;
+              return jsxs("div", {
+                onClick: () => switchTab(p),
+                onAuxClick: (e) => { if (e.button === 1) { e.preventDefault(); e.stopPropagation(); closeTab(p); } },
+                onMouseDown: (e) => { if (e.button === 1) e.preventDefault(); },
+                title: p + (isTabDirty ? " — есть несохранённые правки" : ""),
+                style: {
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  height: 22,
+                  padding: "0 6px 0 10px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  font: "var(--dsw-font-s-14)",
+                  background: active ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
+                  color: active ? "var(--dsw-alias-label-primary)" : "var(--dsw-alias-label-secondary, #8a94a6)",
+                  boxShadow: active ? "inset 0 -2px 0 var(--dsw-alias-state-business-primary)" : undefined,
+                },
+                children: [
+                  jsx("span", { children: p.split(/[\\/]/).pop() }),
+                  isTabDirty ? jsx("span", { title: "Не сохранён", style: { color: "#ffb300", flexShrink: 0 }, children: "●" }) : null,
+                  jsx("span", {
+                    onClick: (e) => { e.stopPropagation(); closeTab(p); },
+                    title: "Закрыть",
                     style: {
                       flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                      width: 20, height: 20, border: "none", borderRadius: 6, cursor: saving ? "wait" : "pointer",
-                      background: "transparent", color: dirty ? "var(--dsw-alias-state-business-primary, #4a9eff)" : "#8a94a6",
-                      padding: 0,
+                      width: 14, height: 14, borderRadius: 4,
+                      cursor: "pointer", opacity: 0.45, fontSize: 12, lineHeight: "12px",
                     },
-                    children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
-                      jsx("path", { d: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" }),
-                      jsx("polyline", { points: "17 21 17 13 7 13 7 21" }),
-                      jsx("polyline", { points: "7 3 7 8 15 8" }),
-                    ] }),
+                    onMouseEnter: (e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.background = "var(--dsw-alias-interactive-bg-hover)"; },
+                    onMouseLeave: (e) => { e.currentTarget.style.opacity = "0.45"; e.currentTarget.style.background = "transparent"; },
+                    children: "✕",
                   }),
-                ] })
-              : null,
+                ],
+              });
+            }),
+            openPath ? jsxs("div", { style: { marginLeft: "auto", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }, children: [
+              saveError ? jsx("span", { style: { color: "#f44336" }, title: saveError, children: "✕ ошибка сохранения" }) : null,
+              jsx("button", {
+                onClick: () => revertFileRef.current?.(),
+                title: "Перечитать с диска — сбросить несохранённые изменения (" + openPath + ")",
+                style: {
+                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 20, height: 20, border: "none", borderRadius: 6,
+                  cursor: "pointer", background: "transparent", color: "#8a94a6",
+                  padding: 0, opacity: dirty ? 1 : 0.55,
+                },
+                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                  jsx("polyline", { points: "23 4 23 10 17 10" }),
+                  jsx("path", { d: "M20.49 15a9 9 0 1 1-2.12-9.36L23 10" }),
+                ] }),
+              }),
+              jsx("button", {
+                onClick: () => saveFileRef.current?.(),
+                title: saving ? "Сохранение…" : dirty ? "Сохранить (Ctrl+S) — " + openPath : "Сохранено",
+                disabled: saving,
+                style: {
+                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 20, height: 20, border: "none", borderRadius: 6, cursor: saving ? "wait" : "pointer",
+                  background: "transparent", color: dirty ? "var(--dsw-alias-state-business-primary, #4a9eff)" : "#8a94a6",
+                  padding: 0, opacity: dirty || saving ? 1 : 0.55,
+                },
+                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                  jsx("path", { d: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" }),
+                  jsx("polyline", { points: "17 21 17 13 7 13 7 21" }),
+                  jsx("polyline", { points: "7 3 7 8 15 8" }),
+                ] }),
+              }),
+            ] }) : null,
           ],
         }),
         jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
@@ -1714,6 +2000,7 @@ window.__ModuleLoader__.load({
                 children: "Метаданные",
               }),
             ]}),
+            renderGitFilter(),
             jsx("input", {
               type: "text",
               placeholder: mode === "meta" ? "Поиск по метаданным…" : "Поиск по имени файла…",
@@ -1731,6 +2018,8 @@ window.__ModuleLoader__.load({
             ? renderSearchResults()
             : mode === "meta"
             ? renderMetaTree()
+            : gitFilter
+            ? renderGitList()
             : jsxs(React.Fragment, { children: [
                 treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + treeError }) : null,
                 !rootPath && !treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 12, opacity: 0.6 }, children: "Загрузка…" }) : null,
@@ -1797,7 +2086,7 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "" });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", showUntracked: false });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
@@ -1805,16 +2094,16 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, []);
       React.useEffect(() => {
-        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "" });
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", showUntracked: cfg.showUntracked === true });
       }, [cfg]);
       const save = async () => {
         try {
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin }),
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked }),
           });
-          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin }));
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked }));
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } catch (e) {
@@ -1827,6 +2116,10 @@ window.__ModuleLoader__.load({
         jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
           jsx("input", { type: "checkbox", checked: form.lspEnabled, onChange: (e) => setForm((f) => ({ ...f, lspEnabled: e.target.checked })) }),
           "LSP (диагностика, автодополнение, переходы)",
+        ]}),
+        jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
+          jsx("input", { type: "checkbox", checked: form.showUntracked, onChange: (e) => setForm((f) => ({ ...f, showUntracked: e.target.checked })) }),
+          "Показывать в изменениях untracked-файлы (не добавленные в git)",
         ]}),
         jsxs("label", { style: { display: "block" }, children: [
           jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Порт сервера" }),
