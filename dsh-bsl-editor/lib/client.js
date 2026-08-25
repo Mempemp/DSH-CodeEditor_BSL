@@ -1036,14 +1036,18 @@ window.__ModuleLoader__.load({
       const refreshGitDecorationsRef = useRef(null);
       const checkExternalChange = useCallback(async (fullPath, model) => {
         const known = modelMtimesRef.current.get(fullPath);
-        if (known == null) return;
         let disk;
         try {
           disk = await fetchJson("/bsl/stat?path=" + encodeURIComponent(fullPath));
         } catch { return; }
         const mtime = disk.mtimeMs ?? null;
-        if (mtime == null || Math.abs(mtime - known) < 1) return;
+        if (mtime == null) return;
+        if (known != null && Math.abs(mtime - known) < 1) return;
+        // known == null — refs пересозданы ремоунтом EditorView; модель жива,
+        // но база для сравнения утрачена. Сверяем КОНТЕНТ с диском напрямую.
+        const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
         modelMtimesRef.current.set(fullPath, mtime);
+        if (data.content === model.getValue()) return;
         const isDirty = openBuffersRef.current.has(fullPath);
         if (isDirty) {
           setEditorNotice("Файл изменён на диске. Ваши правки сохранены в буфере.");
@@ -1052,7 +1056,8 @@ window.__ModuleLoader__.load({
               const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
               const ed = editorRef.current;
               const st = ed?.saveViewState?.();
-              model.setValue(data.content);
+              programmaticSetRef.current += 1;
+              try { model.setValue(data.content); } finally { programmaticSetRef.current -= 1; }
               if (ed && st) {
                 requestAnimationFrame(() => {
                   const e2 = editorRef.current;
@@ -1073,7 +1078,8 @@ window.__ModuleLoader__.load({
           if (data.content === model.getValue()) return;
           const ed = editorRef.current;
           const st = ed?.saveViewState?.();
-          model.setValue(data.content);
+          programmaticSetRef.current += 1;
+          try { model.setValue(data.content); } finally { programmaticSetRef.current -= 1; }
           if (ed && st) {
             requestAnimationFrame(() => {
               const e2 = editorRef.current;
@@ -1085,6 +1091,9 @@ window.__ModuleLoader__.load({
         }
       }, [markTabDirty]);
       const externalReloadRef = useRef(null);
+      // Программная подмена текста (hot-reload/revert): onDidChangeContent
+      // не должен считать её правкой пользователя.
+      const programmaticSetRef = useRef(0);
 
       const openFile = useCallback(async (rawPath) => {
         // Canonical form up front: every consumer (tabs, refs, dirty map)
@@ -1113,6 +1122,11 @@ window.__ModuleLoader__.load({
             if (parked != null) {
               model = monaco.editor.createModel(parked, lang, uri);
               setOpenContent(parked);
+              // Базовый mtime для parked-моделей: без него checkExternalChange
+              // всегда выходит по known == null.
+              fetchJson("/bsl/stat?path=" + encodeURIComponent(fullPath))
+                .then((d) => { modelMtimesRef.current.set(fullPath, d.mtimeMs ?? null); })
+                .catch(() => {});
             } else {
               // Первый заход в этой сессии: после отрисовки диффов автопереход
               // к первому блоку изменений.
@@ -1147,6 +1161,7 @@ window.__ModuleLoader__.load({
           // be current for the tab system to be lossless).
           dirtySubRef.current?.dispose?.();
           dirtySubRef.current = model.onDidChangeContent(() => {
+            if (programmaticSetRef.current > 0) return;
             setDirty(true);
             markTabDirty(fullPath, true, model.getValue());
             // Keep the persist mirror current so session switches replay
