@@ -298,6 +298,8 @@ export class MetaModel {
     this.flat = null; // flattened ConfigDumpInfo entries (xml)
     this.objCache = new Map(); // object def (edt .mdo / object .xml) by key
     this.groupsCache = null; // [ {key,label,icon,count,hasCommon} ]
+    this.changedSet = null; // Set<relPath> — активен только при changed=1
+    this.changedCountsCache = new Map(); // dir -> отфильтрованный список объектов
   }
 
   async init() {
@@ -868,17 +870,105 @@ export class MetaModel {
 
   // --- top-level dispatch ----------------------------------------------------
 
+  // --- changed filter (changedSet active → tree shows only touched objects) --
+
+  setChangedFilter(files) {
+    // null — снять фильтр (показывать всё); [] — фильтр активен, изменений нет
+    // (пустое дерево); массив путей — обычный активный фильтр.
+    this.changedCountsCache.clear();
+    if (files === null || files === undefined) { this.changedSet = null; return; }
+    const rootAbs = join(this.configRoot, "").replace(/\\/g, "/");
+    const norm = rootAbs.endsWith("/") ? rootAbs : rootAbs + "/";
+    const s = new Set();
+    for (const f of files) {
+      let p = String(f.path || "").replace(/\\/g, "/");
+      // git-status отдаёт пути относительно корня репозитория —
+      // приводим к абсолютному виду через configRoot.
+      if (!/^[a-zA-Z]:\//.test(p)) p = norm + p.replace(/^\.?\//, "");
+      if (!p.startsWith(norm)) continue;
+      s.add(p);
+      // Каталоги-предки: объект формата object — это папка; отметим и её.
+      let cur = p;
+      while (cur.length > norm.length) {
+        cur = cur.slice(0, cur.lastIndexOf("/"));
+        if (cur.length > norm.length) s.add(cur + "/");
+      }
+    }
+    this.changedSet = s;
+  }
+
+  // Есть ли среди изменённых файлов хоть один внутри объекта dir/objName.
+  objChanged(dir, objName) {
+    if (!this.changedSet) return true;
+    const prefix = join(this.configRoot, dir, objName, "").replace(/\\/g, "/");
+    for (const p of this.changedSet) {
+      if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
+  changedObjects(dir) {
+    const base = join(this.configRoot, dir, "").replace(/\\/g, "/");
+    const names = new Set();
+    for (const p of this.changedSet) {
+      if (!p.startsWith(base)) continue;
+      const rest = p.slice(base.length).replace(/^\/+/, "");
+      if (!rest) continue;
+      const top = rest.split("/")[0];
+      if (top.endsWith(".xml")) names.add(top.slice(0, -4));
+      else names.add(top);
+    }
+    return [...names].sort((a, b) => a.localeCompare(b, "ru")).map((name) => ({
+      key: dir + "/" + name,
+      label: name,
+      icon: this.groupIcon(dir),
+      count: 1,
+    }));
+  }
+
+  async filterGroups(groups) {
+    const out = [];
+    for (const g of groups) {
+      // Корневые модули конфигурации (key === null): показываем по наличию
+      // изменённого файла среди их file.
+      if (!g.key) {
+        const f = String(g.file || "").replace(/\\/g, "/");
+        if (f && this.changedSet?.has(f)) out.push({ ...g });
+        continue;
+      }
+      if (g.key === "Общие") {
+        const children = await this.filterGroups(g.children ?? []);
+        if (children.length) out.push({ ...g, children, count: children.length });
+        continue;
+      }
+      const n = this.changedObjects(g.key).length;
+      if (n > 0) out.push({ ...g, count: n });
+    }
+    return out;
+  }
+
   async list(key) {
     await this.init();
     key = String(key || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    if (!key) return { items: this.groupsCache ?? [] };
+    if (!key) {
+      const root = this.groupsCache ?? [];
+      return { items: this.changedSet ? await this.filterGroups(root) : root };
+    }
     if (key === "Общие") {
       const g = (this.groupsCache ?? []).find((x) => x.key === "Общие");
-      return { items: g?.children ?? [] };
+      const items = g?.children ?? [];
+      return { items: this.changedSet ? await this.filterGroups(items) : items };
     }
     const segs = key.split("/");
-    if (segs.length === 1) return { items: await this.listObjects(segs[0]) };
-    if (segs.length === 2) return { items: await this.listSections(key) };
+    if (segs.length === 1) {
+      if (this.changedSet) return { items: await this.changedObjects(segs[0]) };
+      return { items: await this.listObjects(segs[0]) };
+    }
+    if (segs.length === 2) {
+      const [dir, objName] = splitObjKey(key);
+      if (this.changedSet && !this.objChanged(dir, objName)) return { items: [] };
+      return { items: await this.listSections(key) };
+    }
     const objKey = segs.slice(0, 2).join("/");
     const [dir, objName] = splitObjKey(objKey);
     if (segs.length === 3) {

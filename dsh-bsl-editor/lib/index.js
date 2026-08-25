@@ -30,7 +30,9 @@ export const Config = z.object({
   /** LSP master switch; off by default — unstable on large configurations. */
   lspEnabled: z.boolean().default(false),
   /** Include git-untracked files in the «Изменённые» tree filter. */
-  showUntracked: z.boolean().default(false),
+  showUntracked: z.boolean().default(true),
+  /** Intercept chat file-link clicks (ctx.workspaces.openPath) into this editor. */
+  interceptChatOpen: z.boolean().default(true),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -262,9 +264,23 @@ function ensureIndex(root) {
 async function handleSearch(root, url, res) {
   const q = (url.searchParams.get("q") || "").trim().toLowerCase();
   if (!q) return json(res, 200, { root, query: "", results: [] });
+  // changed=1: ограничить выдачу файлами из git-status (режим «Изменённые»).
+  let changedSet = null;
+  if (url.searchParams.get("changed")) {
+    try {
+      const st = await new Promise((resolve, reject) => {
+        // Мок-res под реальный хелпер json() (writeHead/end).
+        handleGitStatus(root, { writeHead: () => {}, end: (b) => resolve(JSON.parse(b)) }, null).catch(reject);
+        setTimeout(() => reject(new Error("git status timeout")), 5000);
+      });
+      changedSet = new Set((st?.files || []).map((f) => f.path.replace(/\\/g, "/")));
+    } catch { changedSet = new Set(); }
+  }
   try {
     const entries = await ensureIndex(root);
-    const results = entries.filter((e) => e.name.toLowerCase().includes(q)).slice(0, 200);
+    let results = entries.filter((e) => e.name.toLowerCase().includes(q));
+    if (changedSet) results = results.filter((e) => changedSet.has(e.rel));
+    results = results.slice(0, 200);
     json(res, 200, { root, query: q, results });
   } catch (e) {
     json(res, 400, { error: e.message });
@@ -284,6 +300,18 @@ async function handleRead(root, url, res, config) {
     json(res, 200, { path: abs, content, mtimeMs: st.mtimeMs, size: st.size });
   } catch (e) {
     json(res, 400, { error: e.message });
+  }
+}
+
+// Лёгкая проверка метаданных файла (для hot-reload открытых вкладок).
+async function handleStat(root, url, res) {
+  const path = url.searchParams.get("path") || "";
+  try {
+    const abs = await resolveInside(root, path);
+    const st = await fs.stat(abs);
+    json(res, 200, { path: abs, mtimeMs: st.mtimeMs, size: st.size });
+  } catch (e) {
+    json(res, 404, { error: e.message });
   }
 }
 
@@ -325,8 +353,16 @@ async function handleWrite(root, req, res) {
   }
 }
 
+// Кэш git-status: spawn git на большом репо занимает секунды, а статус нужен
+// на каждый клик по дереву метаданных в режиме фильтра.
+let gitStatusCache = new Map(); // root -> { at, files }
+const GIT_STATUS_TTL = 5000;
 async function handleGitStatus(root, res, config) {
   // Untracked entries ("?? path") are opt-in: most of the time they are noise.
+  const cached = gitStatusCache.get(root);
+  if (cached && Date.now() - cached.at < GIT_STATUS_TTL && (cached.showUntracked || !config?.showUntracked)) {
+    return json(res, 200, { ok: true, files: cached.files });
+  }
   const r = runGit(root, ["status", "--porcelain", "-z", ...(config?.showUntracked ? [] : ["--untracked-files=no"])]);
   if (!r.ok) return json(res, 200, { ok: false, files: [] });
   const files = r.output.split("\0").filter(Boolean).map((line) => {
@@ -334,6 +370,7 @@ async function handleGitStatus(root, res, config) {
     const path = line.slice(3);
     return { status, path };
   });
+  gitStatusCache.set(root, { at: Date.now(), showUntracked: !!config?.showUntracked, files });
   json(res, 200, { ok: true, files });
 }
 
@@ -404,6 +441,20 @@ async function handleMetaList(root, url, res) {
   try {
     const m = getMetaModel(root);
     await m.init();
+    // changed=1: активировать фильтр по git-статусам (иерархия сохраняется,
+    // остаются только объекты с изменёнными файлами).
+    if (url.searchParams.get("changed")) {
+      const st = await new Promise((resolve, reject) => {
+        handleGitStatus(root, { writeHead: () => {}, end: (b) => resolve(JSON.parse(b)) }, null).catch(reject);
+        setTimeout(() => reject(new Error("git status timeout")), 5000);
+      });
+      // config здесь недоступен (handleMetaList не получает его) — кэш
+      // git-status заполняется полным (untracked-включающим) вариантом из
+      // основного роута; для фильтра это корректно.
+      m.setChangedFilter(st?.files || []); // [] = изменений нет → пустое дерево
+    } else if (m.changedSet !== null) {
+      m.setChangedFilter(null);
+    }
     const { items } = await m.list(url.searchParams.get("p") || "");
     json(res, 200, { ok: true, format: m.format, items });
   } catch (e) {
@@ -545,6 +596,7 @@ export function apply(ctx, config) {
     handler: (_req, res) => json(res, 200, {
       lspEnabled: config.lspEnabled,
       showUntracked: config.showUntracked !== false,
+      interceptChatOpen: config.interceptChatOpen !== false,
       serverPort: config.serverPort,
       serverBin: config.serverBin,
       workspaceDir: config.workspaceDir,
@@ -562,6 +614,7 @@ export function apply(ctx, config) {
           const next = {
             lspEnabled: patch.lspEnabled ?? config.lspEnabled,
             showUntracked: patch.showUntracked ?? (config.showUntracked !== false),
+            interceptChatOpen: patch.interceptChatOpen ?? (config.interceptChatOpen !== false),
             serverPort: patch.serverPort ?? config.serverPort,
             serverBin: patch.serverBin ?? config.serverBin,
             sourceExtensions: patch.sourceExtensions ?? config.sourceExtensions,
@@ -591,6 +644,10 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/read",
     handler: (req, res) => handleRead(root, new URL(req.url, "http://x"), res, config),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/stat",
+    handler: (req, res) => handleStat(root, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "exact", path: "/bsl/write",

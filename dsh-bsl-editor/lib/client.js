@@ -48,7 +48,10 @@ window.__ModuleLoader__.load({
     // and focus the composer (user pastes). Best-effort: try to insert directly
     // into the composer's editable (textarea / contenteditable).
     function sendToChat(text) {
-      try { navigator.clipboard?.writeText(text); } catch {}
+      // Ссылка идёт с ведущим переносом строки: вставка в непустой композер
+      // не приклеивается к предыдущему тексту.
+      const ref = "\n" + text;
+      try { navigator.clipboard?.writeText(ref); } catch {}
       let inserted = false;
       const seat = document.querySelector("[data-composer-seat]");
       const editable = (seat || document).querySelector('[contenteditable="true"], textarea, [role="textbox"]');
@@ -58,7 +61,9 @@ window.__ModuleLoader__.load({
           if (editable.tagName === "TEXTAREA") {
             const s = editable.selectionStart ?? editable.value.length;
             const e = editable.selectionEnd ?? s;
-            editable.setRangeText(text, s, e, "end");
+            const atEnd = s >= editable.value.length;
+            const piece = atEnd && editable.value.length > 0 ? ref : text;
+            editable.setRangeText(piece, s, e, "end");
             editable.dispatchEvent(new Event("input", { bubbles: true }));
             inserted = true;
           } else {
@@ -502,6 +507,97 @@ window.__ModuleLoader__.load({
     });
     const editorPersistBySession = new Map(); // sessionId -> persist snapshot
 
+    // Мост apply ↔ EditorView: перехватчик openPath живёт на уровне модуля,
+    // а openFile/reveal — внутри компонента. EditorView присваивает bridge
+    // в эффекте после монтирования и чистит при размонтировании.
+    let editorBridge = null;
+    // Открытия, пришедшие когда вкладка Editor не смонтирована (пользователь
+    // в чате): применяются при следующем монтировании EditorView.
+    let pendingOpens = [];
+
+    // Канонический путь вкладок: обратные слеши → прямые, диск в верхний регистр.
+    function normPath(p) {
+      let s = String(p || "").replace(/\\/g, "/");
+      if (/^[a-z]:/.test(s)) s = s[0].toUpperCase() + s.slice(1);
+      return s;
+    }
+
+    // Корень воркспейса плагина (/bsl/workspaces → root), кэшируется.
+    let wsRootCache = "";
+    async function getWsRoot() {
+      if (wsRootCache) return wsRootCache;
+      try {
+        const data = await fetchJson("/bsl/workspaces");
+        wsRootCache = data.root ? String(data.root) : "";
+      } catch {}
+      return wsRootCache;
+    }
+
+    // Путь из чата → абсолютный канонический путь внутри корня, либо null.
+    // Относительные пути резолвятся против того же root, что и в /bsl/read
+    // хоста (resolveInside): абсолют — как есть, относительный — join(root, p).
+    async function resolveChatPath(raw) {
+      let p = String(raw ?? "").trim();
+      if (!p) return null;
+      p = p.replace(/^file:\/\/\//, "");
+      const root = await getWsRoot();
+      if (!root || !/^[a-zA-Z]:[\\/]/.test(root)) return null;
+      const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
+      let abs = p.replace(/\\/g, "/");
+      if (!/^[a-zA-Z]:\//.test(abs)) {
+        abs = rootNorm + "/" + abs.replace(/^\.\//, "").replace(/^\/+/, "");
+      }
+      // Схлопнуть "." и "..", затем проверить, что путь не вышел за корень.
+      const parts = [];
+      for (const seg of abs.split("/")) {
+        if (seg === "..") parts.pop();
+        else if (seg && seg !== ".") parts.push(seg);
+      }
+      abs = parts.join("/");
+      if (!(abs.toLowerCase() === rootNorm.toLowerCase() || abs.toLowerCase().startsWith(rootNorm.toLowerCase() + "/"))) return null;
+      return normPath(abs);
+    }
+
+    // Тихий клик по табу «Editor» (таб-бар рендерится только когда вкладок > 1).
+    function switchToEditorTab() {
+      const tabs = document.querySelectorAll('[role="tablist"] [role="tab"]');
+      for (const t of tabs) {
+        if ((t.textContent || "").trim() === "Editor") { t.click(); return; }
+      }
+    }
+
+    // Полный разбор unified diff: номера добавленных строк новой версии +
+    // блоки удалённых строк; afterLine — строка новой версии, ПЕРЕД которой
+    // стоит блок (= счётчик новых строк после последнего "+"/" " в hunk'е).
+    function parseUnifiedDiff(diff) {
+      const addedLines = new Set();
+      const deletedBlocks = [];
+      const lines = String(diff || "").split("\n");
+      let i = 0;
+      while (i < lines.length) {
+        const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]);
+        i++;
+        if (!m) continue;
+        let newLine = parseInt(m[3], 10);
+        while (i < lines.length && !lines[i].startsWith("@@")) {
+          const l = lines[i];
+          if (l.startsWith("+")) { addedLines.add(newLine); newLine++; i++; continue; }
+          if (l.startsWith("-")) {
+            const texts = [];
+            while (i < lines.length && lines[i].startsWith("-")) {
+              texts.push(lines[i].slice(1));
+              i++;
+            }
+            deletedBlocks.push({ afterLine: newLine, lines: texts });
+            continue;
+          }
+          if (l.startsWith(" ")) newLine++;
+          i++;
+        }
+      }
+      return { addedLines, deletedBlocks };
+    }
+
     function EditorView(props) {
       // DSH hands every session-scoped entry its sessionId as a prop; the
       // persisted state is looked up per session so each chat keeps its own
@@ -557,6 +653,8 @@ window.__ModuleLoader__.load({
       const autoRetriesRef = useRef(0); // bounded auto-reconnect counter for LSP
       const containerRef = useRef(null);
       const decorationIdsRef = useRef([]);
+      const addedDecoIdsRef = useRef([]);
+      const diffZoneIdsRef = useRef([]);
       const rootRef = useRef(null);
       const treeBodyRef = useRef(null);
       const draggingRef = useRef(false);
@@ -565,6 +663,9 @@ window.__ModuleLoader__.load({
       const mouseInEditorRef = useRef(false);
       const staticNavRef = useRef(null); // { word, targets, index } for F12 cycling
       const f12BoundRef = useRef(null); // editor.addCommand id — bind F12 once
+      const diffNavRef = useRef({ anchors: [], index: -1 }); // якоря изменений + текущий индекс (вне useState — без ререндеров)
+      const diffWidgetRef = useRef(null); // overlay-виджет навигации { dom, label }
+      const navigateDiffRef = useRef(null);
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
       useEffect(() => { openPathRef.current = openPath; }, [openPath]);
       const dirtyRef = useRef(false);
@@ -619,7 +720,11 @@ window.__ModuleLoader__.load({
         if (!document.querySelector("style[data-dsh-bsl-tree-css]")) {
           const st = document.createElement("style");
           st.setAttribute("data-dsh-bsl-tree-css", "1");
-          st.textContent = ".dsh-bsl-row:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsh-bsl-resizer{background:transparent;transition:background .12s}.dsh-bsl-resizer:hover{background:var(--dsw-alias-state-business-primary)}.dsh-bsl-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}";
+          st.textContent = ".dsh-bsl-row:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsh-bsl-resizer{background:transparent;transition:background .12s}.dsh-bsl-resizer:hover{background:var(--dsw-alias-state-business-primary)}.dsh-bsl-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}"
+            + ".bsl-git-added-line{background:rgba(46,160,67,.15);box-shadow:inset 2px 0 0 rgba(46,160,67,.4)}"
+            + ".bsl-git-del-zone{background:rgba(248,81,73,.12);overflow:hidden}"
+            + ".bsl-git-del-line{color:#f88f8a;font-family:var(--monaco-monospace-font,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:14px;line-height:20px;white-space:pre;text-overflow:clip;overflow:hidden}"
+            + ".bsl-git-flash{animation:bsl-git-flash-kf .6s ease-out}@keyframes bsl-git-flash-kf{from{background:rgba(255,220,90,.35)}to{background:transparent}}";
           document.head.appendChild(st);
         }
         let alive = true;
@@ -823,17 +928,28 @@ window.__ModuleLoader__.load({
           };
           window.addEventListener("keydown", onGlobalKey, true);
           editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveFileRef.current?.());
+          editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.ArrowDown, () => navigateDiffRef.current?.(1));
+          editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.ArrowUp, () => navigateDiffRef.current?.(-1));
 
           // Keep the persisted caret/scroll fresh in real time, not just at
           // unmount: view switches inside a session (Editor ↔ Chat) tear the
           // component down through a path where unmount cleanup can be missed,
           // so the snapshot must already be current when that happens.
           const scrollSub = editor.onDidScrollChange((e) => { editorPersist.scrollTop = e.scrollTop || 0; });
+          // Скролл/клик по файлу: актуализировать счётчик дифф-навигатора
+          // (ближайший якорь выше центра видимой области). Не во время
+          // программного перехода (gotoAnchor сам ставит index).
+          let syncingNav = false;
+          const syncNavSub = editor.onDidScrollChange(() => {
+            if (syncingNav) return;
+            syncingNav = true;
+            try { syncDiffNavRef.current?.(); } finally { syncingNav = false; }
+          });
           const cursorSub = editor.onDidChangeCursorPosition((e) => {
             editorPersist.cursor = { lineNumber: e.position.lineNumber, column: e.position.column };
           });
 
-          return () => { alive = false; scrollSub.dispose(); cursorSub.dispose(); editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
+          return () => { alive = false; scrollSub.dispose(); syncNavSub.dispose(); cursorSub.dispose(); editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
         }).catch((e) => {
           console.error("[dsh-bsl-editor] monaco", e);
           if (alive) setMonacoError(String(e?.message || e));
@@ -897,11 +1013,6 @@ window.__ModuleLoader__.load({
       // letter upper-cased. The same file reached via tree (backslashes),
       // search results or the git list must land on ONE tab, and `openPath`
       // (the server's normalized path) must equal that key for highlighting.
-      const normPath = (p) => {
-        let s = String(p || "").replace(/\\/g, "/");
-        if (/^[a-z]:/.test(s)) s = s[0].toUpperCase() + s.slice(1);
-        return s;
-      };
       const addTab = useCallback((raw) => {
         const path = normPath(raw);
         setTabs((prev) => prev.includes(path) ? prev : [...prev, path]);
@@ -911,6 +1022,69 @@ window.__ModuleLoader__.load({
       // Per-tab Monaco view state (scroll + cursor): saved on leave, restored
       // on return — switching tabs must feel like switching browser tabs.
       const viewStatesRef = useRef(new Map()); // normPath -> monaco view state
+
+      // mtime на диске на момент загрузки модели — для hot-reload вкладок.
+      const modelMtimesRef = useRef(new Map()); // normPath -> mtimeMs
+      // Путь файла, ожидающего автопереход к первому диффу после открытия.
+      const freshOpenPathRef = useRef(null);
+      const gotoAnchorRef = useRef(null);
+      const syncDiffNavRef = useRef(null);
+
+      // Файл изменился извне (агент/внешний редактор): чистый буфер тихо
+      // перечитываем, грязный — баннер с кнопкой перезагрузки.
+      // refreshGitDecorations объявлен ниже (TDZ) — доступ через ref.
+      const refreshGitDecorationsRef = useRef(null);
+      const checkExternalChange = useCallback(async (fullPath, model) => {
+        const known = modelMtimesRef.current.get(fullPath);
+        if (known == null) return;
+        let disk;
+        try {
+          disk = await fetchJson("/bsl/stat?path=" + encodeURIComponent(fullPath));
+        } catch { return; }
+        const mtime = disk.mtimeMs ?? null;
+        if (mtime == null || Math.abs(mtime - known) < 1) return;
+        modelMtimesRef.current.set(fullPath, mtime);
+        const isDirty = openBuffersRef.current.has(fullPath);
+        if (isDirty) {
+          setEditorNotice("Файл изменён на диске. Ваши правки сохранены в буфере.");
+          externalReloadRef.current = async () => {
+            try {
+              const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
+              const ed = editorRef.current;
+              const st = ed?.saveViewState?.();
+              model.setValue(data.content);
+              if (ed && st) {
+                requestAnimationFrame(() => {
+                  const e2 = editorRef.current;
+                  if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+                });
+              }
+              setOpenContent(data.content);
+              markTabDirty(fullPath, false);
+              setDirty(false);
+              setEditorNotice(null);
+              refreshGitDecorationsRef.current?.(fullPath);
+            } catch {}
+          };
+        } else {
+          const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
+          // Контент совпал (mtime обновился без изменения текста) —
+          // перечитывать не нужно: setValue сбросил бы историю undo.
+          if (data.content === model.getValue()) return;
+          const ed = editorRef.current;
+          const st = ed?.saveViewState?.();
+          model.setValue(data.content);
+          if (ed && st) {
+            requestAnimationFrame(() => {
+              const e2 = editorRef.current;
+              if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+            });
+          }
+          setOpenContent(data.content);
+          refreshGitDecorationsRef.current?.(fullPath);
+        }
+      }, [markTabDirty]);
+      const externalReloadRef = useRef(null);
 
       const openFile = useCallback(async (rawPath) => {
         // Canonical form up front: every consumer (tabs, refs, dirty map)
@@ -940,9 +1114,13 @@ window.__ModuleLoader__.load({
               model = monaco.editor.createModel(parked, lang, uri);
               setOpenContent(parked);
             } else {
+              // Первый заход в этой сессии: после отрисовки диффов автопереход
+              // к первому блоку изменений.
+              freshOpenPathRef.current = fullPath;
               const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
               model = monaco.editor.createModel(data.content, lang, uri);
               setOpenContent(data.content);
+              modelMtimesRef.current.set(fullPath, data.mtimeMs ?? null);
               if (lspRef.current) {
                 lspRef.current.notify("textDocument/didOpen", {
                   textDocument: { uri: uri.toString(), languageId: "bsl", version: 1, text: data.content },
@@ -951,6 +1129,7 @@ window.__ModuleLoader__.load({
             }
           } else {
             setOpenContent(model.getValue());
+            checkExternalChange(fullPath, model);
           }
           modelRef.current = model;
           ed.setModel(model);
@@ -980,7 +1159,24 @@ window.__ModuleLoader__.load({
         } catch (e) {
           console.error("[dsh-bsl-editor] open", e);
         }
-      }, []);
+      }, [checkExternalChange]);
+
+      // Возврат к окну DSH: проверить активный файл на внешние изменения,
+      // даже если вкладка не переключалась.
+      useEffect(() => {
+        const onVisible = () => {
+          if (document.visibilityState !== "visible") return;
+          const p = openPathRef.current;
+          const model = modelRef.current;
+          if (p && model) checkExternalChange(p, model);
+        };
+        document.addEventListener("visibilitychange", onVisible);
+        window.addEventListener("focus", onVisible);
+        return () => {
+          document.removeEventListener("visibilitychange", onVisible);
+          window.removeEventListener("focus", onVisible);
+        };
+      }, [checkExternalChange]);
 
       const switchTab = useCallback(async (path) => {
         const p = normPath(path);
@@ -1018,10 +1214,38 @@ window.__ModuleLoader__.load({
 
       const refreshGitDecorations = useCallback(async (path) => {
         if (!editorRef.current || !monacoRef.current) return;
+        // Вызовы из onDidChangeModelContent приходят без аргумента — берём текущий файл
+        if (path == null) path = openPathRef.current;
+        if (!path) return;
         const monaco = monacoRef.current;
         try {
           const data = await fetchJson("/bsl/git-diff?path=" + encodeURIComponent(path));
           const diff = data.diff || "";
+          // Гонка: пока летел запрос, пользователь мог переключить файл —
+          // декорации и зоны чужого диффа применять нельзя. Проверяем модель
+          // ДО любых deltaDecorations/changeViewZones.
+          const ed = editorRef.current;
+          const model = ed.getModel();
+          const lineCount = model ? model.getLineCount() : 0;
+          const modelPath = model ? normPath(decodeURIComponent(model.uri.path.replace(/^\//, ""))) : null;
+          if (!model || modelPath !== normPath(path)) {
+            // zones/anchors belong to another model — drop stale nav state
+            // и подчистить зоны/декорации, оставшиеся от предыдущей модели.
+            diffNavRef.current.anchors = [];
+            diffNavRef.current.index = -1;
+            if (diffWidgetRef.current) diffWidgetRef.current.dom.style.display = "none";
+            try {
+              ed.changeViewZones((acc) => { for (const id of diffZoneIdsRef.current) acc.removeZone(id); });
+            } catch {}
+            diffZoneIdsRef.current = [];
+            try {
+              ed.deltaDecorations(decorationIdsRef.current, []);
+              ed.deltaDecorations(addedDecoIdsRef.current, []);
+            } catch {}
+            decorationIdsRef.current = [];
+            addedDecoIdsRef.current = [];
+            return;
+          }
           // map unified diff hunks to changed line decorations
           const changed = new Set();
           const re = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/gm;
@@ -1041,8 +1265,102 @@ window.__ModuleLoader__.load({
           }));
           const old = decorationIdsRef.current;
           decorationIdsRef.current = editorRef.current.deltaDecorations(old, decorations);
+          const parsed = parseUnifiedDiff(diff);
+          const addedDecorations = [...parsed.addedLines].sort((a, b) => a - b).map((ln) => ({
+            range: new monaco.Range(ln, 1, ln, 1),
+            options: { isWholeLine: true, className: "bsl-git-added-line", linesDecorationsClassName: "bsl-git-added" },
+          }));
+          addedDecoIdsRef.current = editorRef.current.deltaDecorations(addedDecoIdsRef.current, addedDecorations);
+          // В Monaco 0.52 у accessor нет removeAll — треким id зон сами.
+          const zoneIds = [];
+          ed.changeViewZones(function (acc) {
+            for (const id of diffZoneIdsRef.current) acc.removeZone(id);
+            for (const block of parsed.deletedBlocks) {
+              if (!block.lines.length) continue;
+              const node = document.createElement("div");
+              node.className = "bsl-git-del-zone";
+              // Табы в тексте удалённых строк должны рендериться той же
+              // ширины, что и в редакторе (браузерный дефолт — 8).
+              const ts = model ? model.getOptions?.().tabSize : 4;
+              if (ts) { node.style.tabSize = String(ts); node.style.MozTabSize = String(ts); }
+              for (const text of block.lines) {
+                const ln = document.createElement("div");
+                ln.className = "bsl-git-del-line";
+                ln.textContent = text;
+                node.appendChild(ln);
+              }
+              zoneIds.push(acc.addZone({
+                // afterLine — строка, ПЕРЕД которой стоит блок ⇒ зона после предыдущей
+                afterLineNumber: Math.max(0, Math.min(block.afterLine - 1, lineCount)),
+                heightInLines: block.lines.length,
+                domNode: node,
+              }));
+            }
+          });
+          diffZoneIdsRef.current = zoneIds;
+          const anchors = [];
+          // Непрерывные добавленные строки схлопываются в один блок-якорь.
+          const addedSorted = [...parsed.addedLines].sort((a, b) => a - b);
+          for (let i = 0; i < addedSorted.length; i++) {
+            const start = addedSorted[i];
+            while (i + 1 < addedSorted.length && addedSorted[i + 1] === addedSorted[i] + 1) i++;
+            anchors.push({ line: start, kind: "added" });
+          }
+          for (const block of parsed.deletedBlocks) anchors.push({ line: Math.max(1, Math.min(block.afterLine, Math.max(lineCount, 1))), kind: "deleted" });
+          anchors.sort((a, b) => a.line - b.line);
+          // Замена («−строка / +строка») даёт del- и add-якорь на соседних
+          // строках — визуально это один блок, схлопываем в один якорь.
+          const mergedAnchors = [];
+          for (const a of anchors) {
+            const prev = mergedAnchors[mergedAnchors.length - 1];
+            if (prev && a.line - prev.line <= 1) continue;
+            mergedAnchors.push(a);
+          }
+          diffNavRef.current.anchors = mergedAnchors;
+          diffNavRef.current.index = -1;
+          let w = diffWidgetRef.current;
+          if (!w) {
+            const dom = document.createElement("div");
+            dom.style.cssText = "position:absolute;right:20px;top:10px;z-index:30;display:none;align-items:center;gap:2px;padding:3px 5px;border-radius:8px;background:var(--dsw-alias-bg-layer-1,#1b1d22);border:1px solid var(--dsw-alias-border-l2,#3a3d45);box-shadow:0 4px 14px rgba(0,0,0,.35)";
+            const btnCss = "border:none;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;width:30px;height:30px;font-size:16px;display:inline-flex;align-items:center;justify-content:center;";
+            const up = document.createElement("button");
+            up.style.cssText = btnCss;
+            up.textContent = "↑";
+            up.title = "Предыдущее изменение (Alt+↑)";
+            up.onclick = () => navigateDiffRef.current?.(-1);
+            const label = document.createElement("span");
+            label.style.cssText = "min-width:56px;text-align:center;color:var(--dsw-alias-label-primary);font-size:13px;font-weight:600;opacity:.95;pointer-events:none;user-select:none";
+            const down = document.createElement("button");
+            down.style.cssText = btnCss;
+            down.textContent = "↓";
+            down.title = "Следующее изменение (Alt+↓)";
+            down.onclick = () => navigateDiffRef.current?.(1);
+            dom.appendChild(up);
+            dom.appendChild(label);
+            dom.appendChild(down);
+            ed.addOverlayWidget({ getId: () => "bsl.gitnav", getDomNode: () => dom, getPosition: () => null });
+            w = { dom, label };
+            diffWidgetRef.current = w;
+          }
+          w.dom.style.display = mergedAnchors.length ? "inline-flex" : "none";
+          w.label.textContent = mergedAnchors.length ? "1 / " + mergedAnchors.length : "";
+          // Свежеоткрытый файл с диффами: сразу позиционируем на первый блок.
+          // Признак свежести сбрасываем по факту ЛЮБОГО завершённого refresh
+          // этого файла: если диффов не было, флаг не должен дожить до первой
+          // правки (появится дифф — случится ложный автопереход).
+          const isFreshOpen = freshOpenPathRef.current === normPath(path);
+          freshOpenPathRef.current = null;
+          if (isFreshOpen && mergedAnchors.length) {
+            const ed2 = editorRef.current;
+            if (ed2 && !ed2.isDisposed?.()) {
+              requestAnimationFrame(() => {
+                gotoAnchorRef.current?.(0);
+              });
+            }
+          }
         } catch {}
       }, []);
+      refreshGitDecorationsRef.current = refreshGitDecorations;
 
       // Persist the open model back to disk via the host /bsl/write route.
       const saveFile = useCallback(async () => {
@@ -1061,6 +1379,12 @@ window.__ModuleLoader__.load({
           if (!res.ok) throw new Error("HTTP " + res.status);
           setDirty(false);
           markTabDirty(path, false);
+          // Обновить известный mtime: наша же запись на диске не должна
+          // выглядеть как внешнее изменение при следующем checkExternalChange.
+          try {
+            const st = await fetchJson("/bsl/stat?path=" + encodeURIComponent(path));
+            modelMtimesRef.current.set(path, st.mtimeMs ?? null);
+          } catch {}
           refreshGitDecorations(path);
         } catch (e) {
           setSaveError(e?.message || String(e));
@@ -1092,6 +1416,12 @@ window.__ModuleLoader__.load({
             }
           }
           setOpenContent(data.content);
+          // mtime на диске мог измениться с момента загрузки (внешняя правка,
+          // которую revert только что подтянул) — фиксируем актуальное значение.
+          try {
+            const st = await fetchJson("/bsl/stat?path=" + encodeURIComponent(path));
+            modelMtimesRef.current.set(path, st.mtimeMs ?? null);
+          } catch {}
           markTabDirty(path, false);
           setDirty(false);
           setSaveError("");
@@ -1102,6 +1432,68 @@ window.__ModuleLoader__.load({
       }, [markTabDirty, refreshGitDecorations]);
       const revertFileRef = useRef(null);
       revertFileRef.current = revertFile;
+
+      // Cursor-style inline diff navigation: cycle through change anchors
+      // (added lines + deleted-block zones), reveal and flash each one.
+      // Переход к якорю i + подсветка + актуализация счётчика.
+      const gotoAnchor = useCallback((i) => {
+        const ed = editorRef.current;
+        const monaco = monacoRef.current;
+        const nav = diffNavRef.current;
+        if (!ed || !monaco || !nav || !nav.anchors.length) return;
+        nav.index = i;
+        const anchor = nav.anchors[i];
+        ed.revealLineInCenter(anchor.line);
+        ed.setPosition({ lineNumber: anchor.line, column: 1 });
+        const flashIds = ed.deltaDecorations([], [{
+          range: new monaco.Range(anchor.line, 1, anchor.line, 1),
+          options: { isWholeLine: true, className: "bsl-git-flash" },
+        }]);
+        setTimeout(() => {
+          try { ed.deltaDecorations(flashIds, []); } catch {}
+        }, 650);
+        if (diffWidgetRef.current) diffWidgetRef.current.label.textContent = (i + 1) + " / " + nav.anchors.length;
+      }, []);
+      // Синхронизация навигатора с реальной позицией в файле: ближайший
+      // якорь выше центра видимой области считается текущим.
+      const syncDiffNav = useCallback(() => {
+        const ed = editorRef.current;
+        const nav = diffNavRef.current;
+        if (!ed || !nav || !nav.anchors.length || !diffWidgetRef.current) return;
+        const visible = ed.getVisibleRanges();
+        if (!visible.length) return;
+        const top = visible[0].startLineNumber;
+        const bottom = visible[visible.length - 1].endLineNumber;
+        const mid = Math.floor((top + bottom) / 2);
+        let best = -1;
+        for (let i = 0; i < nav.anchors.length; i++) {
+          if (nav.anchors[i].line <= mid) best = i;
+          else break;
+        }
+        if (best === -1) best = 0;
+        if (best !== nav.index) {
+          nav.index = best;
+          diffWidgetRef.current.label.textContent = (best + 1) + " / " + nav.anchors.length;
+        }
+      }, []);
+
+      gotoAnchorRef.current = gotoAnchor;
+      syncDiffNavRef.current = syncDiffNav;
+
+      const navigateDiff = useCallback((dir) => {
+        const ed = editorRef.current;
+        const monaco = monacoRef.current;
+        const nav = diffNavRef.current;
+        if (!ed || !monaco || !nav || !nav.anchors.length) return;
+        const n = nav.anchors.length;
+        // Стартуем от текущей позиции (syncDiffNav мог её поменять после скролла).
+        if (nav.index < 0) {
+          syncDiffNav();
+        }
+        nav.index = (((nav.index + dir) % n) + n) % n;
+        gotoAnchor(nav.index);
+      }, [gotoAnchor, syncDiffNav]);
+      navigateDiffRef.current = navigateDiff;
 
       // LSP feature wiring: once Monaco exists AND the LSP client is connected,
       // register diagnostics/completion/hover/definition/formatting and sync
@@ -1400,15 +1792,18 @@ window.__ModuleLoader__.load({
         let alive = true;
         const t = setTimeout(async () => {
           try {
-            const url = mode === "meta" ? "/bsl/meta/search?q=" : "/bsl/search?q=";
-            const data = await fetchJson(url + encodeURIComponent(q));
+            // В режиме «Изменённые» поиск ограничен файлами из git-status.
+            const url = mode === "meta"
+              ? "/bsl/meta/search?q=" + encodeURIComponent(q)
+              : "/bsl/search?q=" + encodeURIComponent(q) + (gitFilter ? "&changed=1" : "");
+            const data = await fetchJson(url);
             if (alive) setSearchResults(data.results || []);
           } catch {
             if (alive) setSearchResults([]);
           }
         }, 120);
         return () => { alive = false; clearTimeout(t); };
-      }, [search, mode]);
+      }, [search, mode, gitFilter]);
 
       // Reveal a path in the tree: clear the search, load + expand every
       // directory from the root down to the target (inclusive), highlight it,
@@ -1433,11 +1828,32 @@ window.__ModuleLoader__.load({
         setHighlightPath(fullPath);
       }, [rootPath, expanded, children, loadDir]);
 
+      // Мост для перехватчика openPath: обновляется при изменении колбэков,
+      // чистится при размонтировании. При монтировании применяется очередь
+      // pendingOpens — открытия из чата, пришедшие, когда Editor был размонтирован.
+      useEffect(() => {
+        editorBridge = { openFile, reveal, ready: monacoReady };
+        if (monacoReady && pendingOpens.length) {
+          const queue = pendingOpens;
+          pendingOpens = [];
+          for (const p of queue.slice(-5)) {
+            openFile(p);
+            if (typeof reveal === "function") reveal(p);
+          }
+        }
+        return () => { editorBridge = null; };
+      }, [openFile, reveal, monacoReady]);
+
       // ── Metadata tree (1C): lazy load + expand/collapse ────────────────
+      const gitFilterRef = useRef(gitFilter);
+      gitFilterRef.current = gitFilter;
       const loadMeta = useCallback(async (key) => {
         setMetaLoading(true);
         try {
-          const data = await fetchJson("/bsl/meta/list?p=" + encodeURIComponent(key || ""));
+          // Фильтр берём из ref — колбэк всегда видит актуальное состояние.
+          const changed = mode === "meta" && gitFilterRef.current ? "&changed=1" : "";
+          const url = "/bsl/meta/list?p=" + encodeURIComponent(key || "") + changed;
+          const data = await fetchJson(url);
           if (!data.ok) throw new Error(data.error || "meta error");
           setMetaChildren((prev) => { const m = new Map(prev); m.set(key || "", data.items || []); return m; });
           setMetaError("");
@@ -1448,7 +1864,7 @@ window.__ModuleLoader__.load({
         } finally {
           setMetaLoading(false);
         }
-      }, []);
+      }, [mode]);
 
       const metaToggle = useCallback(async (key) => {
         if (metaExpanded.has(key)) {
@@ -1713,10 +2129,27 @@ window.__ModuleLoader__.load({
       const gitStatusColor = (st) => st === "M" ? "#e2c08d" : st === "A" ? "#4caf50" : st === "D" ? "#f44336" : "#8a94a6";
       // "*" matches any porcelain status (incl. combined "AM"/"A?" forms).
       const statusMatches = (st, f) => f === "*" ? !!st : f === "??" ? st.includes("?") : st.split("").some((ch) => ch === f);
-      const renderGitFilter = () => mode !== "files" ? null : jsxs("div", {
+      const applyGitFilter = (key) => {
+        // Обновляем ref синхронно: loadMeta ниже вызывается до ререндера,
+        // иначе запрос уйдёт со старым значением фильтра.
+        gitFilterRef.current = key;
+        setGitFilter(key);
+        setEditorNotice(null);
+        if (key) refreshGit();
+        // Переключение фильтра в режиме метаданных: сбросить кэш дерева,
+        // чтобы оно перезагрузилось с/без changed-фильтра.
+        if (mode === "meta") {
+          setMetaChildren(new Map());
+          setMetaExpanded(new Set());
+          // Эффект первичной загрузки после первого раза больше не срабатывает
+          // (guard по metaInfo) — перезагружаем корень явно.
+          loadMeta("");
+        }
+      };
+      const renderGitFilter = () => jsxs("div", {
         style: { display: "flex", gap: 4, padding: "0 4px 8px" },
         children: gitFilterChips.map((c) => jsx("button", {
-          onClick: () => { setGitFilter(c.key); setEditorNotice(null); if (c.key) refreshGit(); },
+          onClick: () => applyGitFilter(c.key),
           style: {
             flex: 1,
             height: 22,
@@ -2033,7 +2466,18 @@ window.__ModuleLoader__.load({
         }),
                 jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
           !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13, whiteSpace: "pre-wrap" }, children: monacoError ? "Ошибка загрузки редактора:\n" + monacoError : "Загрузка редактора…" }) : null,
-          editorNotice ? jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, textAlign: "center", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-secondary, #8a94a6)", opacity: 0.8, pointerEvents: "none", whiteSpace: "pre-wrap" }, children: editorNotice }) : null,
+          editorNotice ? (
+            externalReloadRef.current
+              ? jsxs("div", { style: { position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 10, display: "flex", alignItems: "center", gap: 10, padding: "6px 14px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", whiteSpace: "pre-wrap" }, children: [
+                  jsx("span", { children: editorNotice }),
+                  jsx("button", {
+                    onClick: () => externalReloadRef.current?.(),
+                    style: { border: "none", borderRadius: 6, padding: "3px 12px", cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" },
+                    children: "Перезагрузить с диска",
+                  }),
+                ] })
+              : jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, textAlign: "center", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-secondary, #8a94a6)", opacity: 0.8, pointerEvents: "none", whiteSpace: "pre-wrap" }, children: editorNotice })
+          ) : null,
         ]}),
         ]}),
         ctxMenu ? jsxs(React.Fragment, { children: [
@@ -2086,7 +2530,7 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", showUntracked: false });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", showUntracked: false, interceptChatOpen: true });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
@@ -2094,16 +2538,16 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, []);
       React.useEffect(() => {
-        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", showUntracked: cfg.showUntracked === true });
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", showUntracked: cfg.showUntracked === true, interceptChatOpen: cfg.interceptChatOpen !== false });
       }, [cfg]);
       const save = async () => {
         try {
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked }),
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked, interceptChatOpen: form.interceptChatOpen }),
           });
-          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked }));
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked, interceptChatOpen: form.interceptChatOpen }));
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } catch (e) {
@@ -2120,6 +2564,10 @@ window.__ModuleLoader__.load({
         jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
           jsx("input", { type: "checkbox", checked: form.showUntracked, onChange: (e) => setForm((f) => ({ ...f, showUntracked: e.target.checked })) }),
           "Показывать в изменениях untracked-файлы (не добавленные в git)",
+        ]}),
+        jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
+          jsx("input", { type: "checkbox", checked: form.interceptChatOpen, onChange: (e) => setForm((f) => ({ ...f, interceptChatOpen: e.target.checked })) }),
+          "Перехватывать открытие файлов из чата",
         ]}),
         jsxs("label", { style: { display: "block" }, children: [
           jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Порт сервера" }),
@@ -2154,9 +2602,66 @@ window.__ModuleLoader__.load({
           PluginSettingsSection,
         ),
       );
+
+      // ── Перехват открытия файлов из чата (ctx.workspaces.openPath) ──────
+      const wsService = ctx.workspaces;
+      if (wsService && typeof wsService.openPath === "function") {
+        // Базовый оригинал сохраняется ОДИН раз: при перевооружении и на
+        // dispose восстанавливаем именно его, а не чужую промежуточную обёртку.
+        const baseOriginal = wsService.openPath;
+        let installed = null;
+        let interceptOn = true;
+        const refreshCfg = () => {
+          fetchJson("/bsl/config").then((c) => { interceptOn = c.interceptChatOpen !== false; }).catch(() => {});
+        };
+        refreshCfg();
+
+        const makeWrapper = (current) => async function interceptedOpenPath(path) {
+          if (interceptOn) {
+            try {
+              const target = await resolveChatPath(path);
+              const bridge = editorBridge;
+              if (target && bridge && typeof bridge.openFile === "function") {
+                bridge.openFile(target);
+                if (typeof bridge.reveal === "function") bridge.reveal(target);
+                setTimeout(switchToEditorTab, 80);
+                return undefined;
+              }
+              // Editor не смонтирован (активна вкладка чата): запоминаем путь
+              // и переключаем вкладку — монтирование применит pendingOpens.
+              if (target) {
+                pendingOpens.push(target);
+                switchToEditorTab();
+                return undefined;
+              }
+            } catch (e) {
+              console.error("[dsh-bsl-editor] chat open", e);
+            }
+          }
+          return current.call(wsService, path);
+        };
+
+        installed = makeWrapper(baseOriginal);
+        wsService.openPath = installed;
+
+        // Само-перевооружение: если поверх нашей обёртки кто-то установил
+        // свою (dsh-better-sidebar и т.п.) — заворачиваемся вокруг текущей.
+        const rearmTimer = setInterval(() => {
+          refreshCfg();
+          if (wsService.openPath !== installed) {
+            installed = makeWrapper(wsService.openPath);
+            wsService.openPath = installed;
+          }
+        }, 2500);
+
+        ctx.on("dispose", () => {
+          clearInterval(rearmTimer);
+          if (wsService.openPath === installed) wsService.openPath = baseOriginal;
+        });
+      }
     }
 
-    const inject = ["slots"];
+    const inject = ["slots", "workspaces"];
     return { apply, inject };
   },
 });
