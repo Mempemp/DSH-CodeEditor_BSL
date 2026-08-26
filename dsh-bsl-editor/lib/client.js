@@ -87,9 +87,10 @@ window.__ModuleLoader__.load({
       showToast(inserted ? "Ссылка вставлена в чат" : "Ссылка скопирована — вставьте в чат (Ctrl+V)");
     }
 
-    // Monaco CDNs tried in order — jsdelivr is blocked/throttled on some
-    // networks, unpkg and cdnjs are the fallbacks.
-    const MONACO_CDNS = [
+    // Monaco: сначала same-origin vendor (/bsl/vendor), затем CDN как запасной.
+    // Vendor-файлы кладутся в resources/vendor при сборке плагина.
+    const MONACO_BASES = [
+      "/bsl/vendor",
       "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs",
       "https://unpkg.com/monaco-editor@0.52.2/min/vs",
       "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs",
@@ -145,7 +146,7 @@ window.__ModuleLoader__.load({
       monacoPromise = (async () => {
         if (window.monaco) return window.monaco;
         let lastErr = null;
-        for (const base of MONACO_CDNS) {
+        for (const base of MONACO_BASES) {
           const stashed = {};
           let ok = false;
           try {
@@ -179,6 +180,14 @@ window.__ModuleLoader__.load({
             }
             const monaco = await new Promise((resolve, reject) => {
               try {
+                // Worker: same-origin vendor, чтобы воркеры не зависели от CDN.
+                if (base === "/bsl/vendor") {
+                  window.MonacoEnvironment = {
+                    getWorkerUrl: () => URL.createObjectURL(new Blob(
+                      ["self.MonacoEnvironment={baseUrl:'/bsl/vendor/'};importScripts('/bsl/vendor/workerMain.js');"],
+                      { type: "text/javascript" })),
+                  };
+                }
                 window.require.config({ paths: { vs: base } });
                 window.require(
                   ["vs/editor/editor.main"],
@@ -231,18 +240,28 @@ window.__ModuleLoader__.load({
     // poisoning every later mount. Keep this promise forever — only the
     // grammar/registry half of the stack is allowed to retry.
     let onigasmReadyPromise = null;
+    // ESM-модули сначала с same-origin vendor, затем CDN.
+    async function importFirst(urls) {
+      let lastErr = null;
+      for (const u of urls) {
+        try { return await import(/* @vite-ignore */ u); } catch (e) { lastErr = e; }
+      }
+      throw lastErr || new Error("all sources failed");
+    }
     function getOnigasmReady() {
       if (!onigasmReadyPromise) {
         onigasmReadyPromise = (async () => {
-          // monaco-textmate@3 uses onigasm INTERNALLY from a fixed jsdelivr URL
-          // — its WASM must be initialized through that exact module instance,
-          // so no CDN fallback for the module itself.
-          const onigasm = await import("https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm");
-          let wasm = null;
-          for (const u of [
+          const onigasm = await importFirst([
+            "/bsl/vendor/onigasm-esm.js",
+            "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm",
+          ]);
+          const wasmUrls = [
+            "/bsl/vendor/onigasm.wasm",
             "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/lib/onigasm.wasm",
             "https://esm.sh/onigasm@2.2.2/lib/onigasm.wasm",
-          ]) {
+          ];
+          let wasm = null;
+          for (const u of wasmUrls) {
             try {
               const r = await fetch(u);
               if (r.ok) { wasm = await r.arrayBuffer(); break; }
@@ -268,12 +287,11 @@ window.__ModuleLoader__.load({
       if (!tmStackPromise) {
         tmStackPromise = (async () => {
           const onigasm = await getOnigasmReady();
-          let tm;
-          try {
-            tm = await import("https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm");
-          } catch {
-            tm = await import("https://esm.sh/monaco-textmate@3.0.1");
-          }
+          const tm = await importFirst([
+            "/bsl/vendor/monaco-textmate-esm.js",
+            "https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm",
+            "https://esm.sh/monaco-textmate@3.0.1",
+          ]);
           const [bslRes, queryRes] = await Promise.all([
             fetch("/bsl/grammar/1c"),
             fetch("/bsl/grammar/1c-query"),
@@ -1451,27 +1469,35 @@ window.__ModuleLoader__.load({
       // Cursor-style inline diff navigation: cycle through change anchors
       // (added lines + deleted-block zones), reveal and flash each one.
       // Переход к якорю i + подсветка + актуализация счётчика.
+      // Программный скролл от revealLineInCenter триггерит onDidScrollChange;
+      // флаг не даёт syncDiffNav пересчитать index во время перехода.
+      let navJumping = false;
       const gotoAnchor = useCallback((i) => {
         const ed = editorRef.current;
         const monaco = monacoRef.current;
         const nav = diffNavRef.current;
         if (!ed || !monaco || !nav || !nav.anchors.length) return;
         nav.index = i;
-        const anchor = nav.anchors[i];
-        ed.revealLineInCenter(anchor.line);
-        ed.setPosition({ lineNumber: anchor.line, column: 1 });
-        const flashIds = ed.deltaDecorations([], [{
-          range: new monaco.Range(anchor.line, 1, anchor.line, 1),
-          options: { isWholeLine: true, className: "bsl-git-flash" },
-        }]);
-        setTimeout(() => {
-          try { ed.deltaDecorations(flashIds, []); } catch {}
-        }, 650);
+        navJumping = true;
+        try {
+          ed.revealLineInCenter(nav.anchors[i].line);
+          ed.setPosition({ lineNumber: nav.anchors[i].line, column: 1 });
+          const flashIds = ed.deltaDecorations([], [{
+            range: new monaco.Range(nav.anchors[i].line, 1, nav.anchors[i].line, 1),
+            options: { isWholeLine: true, className: "bsl-git-flash" },
+          }]);
+          setTimeout(() => {
+            try { ed.deltaDecorations(flashIds, []); } catch {}
+          }, 650);
+        } finally {
+          setTimeout(() => { navJumping = false; }, 120);
+        }
         if (diffWidgetRef.current) diffWidgetRef.current.label.textContent = (i + 1) + " / " + nav.anchors.length;
       }, []);
-      // Синхронизация навигатора с реальной позицией в файле: ближайший
-      // якорь выше центра видимой области считается текущим.
+      // Синхронизация навигатора с реальной позицией в файле: текущим считается
+      // якорь, ближайший к центру видимой области.
       const syncDiffNav = useCallback(() => {
+        if (navJumping) return;
         const ed = editorRef.current;
         const nav = diffNavRef.current;
         if (!ed || !nav || !nav.anchors.length || !diffWidgetRef.current) return;
@@ -1480,12 +1506,12 @@ window.__ModuleLoader__.load({
         const top = visible[0].startLineNumber;
         const bottom = visible[visible.length - 1].endLineNumber;
         const mid = Math.floor((top + bottom) / 2);
-        let best = -1;
+        let best = 0;
+        let bestDist = Infinity;
         for (let i = 0; i < nav.anchors.length; i++) {
-          if (nav.anchors[i].line <= mid) best = i;
-          else break;
+          const d = Math.abs(nav.anchors[i].line - mid);
+          if (d < bestDist) { bestDist = d; best = i; }
         }
-        if (best === -1) best = 0;
         if (best !== nav.index) {
           nav.index = best;
           diffWidgetRef.current.label.textContent = (best + 1) + " / " + nav.anchors.length;

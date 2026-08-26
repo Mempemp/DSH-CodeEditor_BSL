@@ -528,6 +528,44 @@ function handleGrammar(_root, url, res) {
   res.end(readFileSync(p));
 }
 
+// Vendored runtime assets (Monaco, onigasm, monaco-textmate) — same-origin,
+// чтобы раскраска не зависела от доступности CDN.
+const VENDOR_FILES = {
+  "loader.js": ["loader.js", "application/javascript"],
+  "editor.main.js": ["editor.main.js", "application/javascript"],
+  "editor.main.css": ["editor.main.css", "text/css"],
+  "workerMain.js": ["workerMain.js", "application/javascript"],
+  "onigasm-esm.js": ["onigasm-esm.js", "application/javascript"],
+  "monaco-textmate-esm.js": ["monaco-textmate-esm.js", "application/javascript"],
+  "onigasm.wasm": ["onigasm.wasm", "application/wasm"],
+};
+let vendorDir = null;
+function resolveVendorDir() {
+  if (vendorDir) return vendorDir;
+  let dir = fileURLToPath(new URL(".", import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    const candidate = join(dir, "resources", "vendor");
+    if (existsSync(candidate)) {
+      vendorDir = candidate;
+      return vendorDir;
+    }
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+function handleVendor(_root, url, res) {
+  const name = (url.pathname || "").split("/").pop();
+  const entry = VENDOR_FILES[name];
+  if (!entry) return json(res, 404, { error: "unknown vendor asset" });
+  const dir = resolveVendorDir();
+  const p = dir ? join(dir, entry[0]) : null;
+  if (!p || !existsSync(p)) return json(res, 404, { error: "vendor asset missing" });
+  res.writeHead(200, { "content-type": entry[1], "cache-control": "public, max-age=86400" });
+  res.end(readFileSync(p));
+}
+
 export function apply(ctx, config) {
   // Settings saved from the in-tab panel win over the bundled defaults.
   Object.assign(config, loadPluginOverrides());
@@ -648,6 +686,10 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/stat",
     handler: (req, res) => handleStat(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "prefix", path: "/bsl/vendor",
+    handler: (req, res) => handleVendor(root, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "exact", path: "/bsl/write",
