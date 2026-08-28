@@ -181,10 +181,13 @@ window.__ModuleLoader__.load({
             const monaco = await new Promise((resolve, reject) => {
               try {
                 // Worker: same-origin vendor, чтобы воркеры не зависели от CDN.
+                // Внутри blob-воркера относительные URL не резолвятся —
+                // подставляем полный origin.
                 if (base === "/bsl/vendor") {
+                  const origin = location.origin;
                   window.MonacoEnvironment = {
                     getWorkerUrl: () => URL.createObjectURL(new Blob(
-                      ["self.MonacoEnvironment={baseUrl:'/bsl/vendor/'};importScripts('/bsl/vendor/workerMain.js');"],
+                      ["self.MonacoEnvironment={baseUrl:'" + origin + "/bsl/vendor/'};importScripts('" + origin + "/bsl/vendor/workerMain.js');"],
                       { type: "text/javascript" })),
                   };
                 }
@@ -252,11 +255,11 @@ window.__ModuleLoader__.load({
       if (!onigasmReadyPromise) {
         onigasmReadyPromise = (async () => {
           const onigasm = await importFirst([
-            "/bsl/vendor/onigasm-esm.js",
+            "/bsl/vendor/onigasm-esm.js?v=2",
             "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/+esm",
           ]);
           const wasmUrls = [
-            "/bsl/vendor/onigasm.wasm",
+            "/bsl/vendor/onigasm.wasm?v=2",
             "https://cdn.jsdelivr.net/npm/onigasm@2.2.2/lib/onigasm.wasm",
             "https://esm.sh/onigasm@2.2.2/lib/onigasm.wasm",
           ];
@@ -288,7 +291,7 @@ window.__ModuleLoader__.load({
         tmStackPromise = (async () => {
           const onigasm = await getOnigasmReady();
           const tm = await importFirst([
-            "/bsl/vendor/monaco-textmate-esm.js",
+            "/bsl/vendor/monaco-textmate-esm.js?v=2",
             "https://cdn.jsdelivr.net/npm/monaco-textmate@3.0.1/+esm",
             "https://esm.sh/monaco-textmate@3.0.1",
           ]);
@@ -1079,7 +1082,7 @@ window.__ModuleLoader__.load({
               if (ed && st) {
                 requestAnimationFrame(() => {
                   const e2 = editorRef.current;
-                  if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+                  if (e2 && !e2.isDisposed?.() && modelRef.current === model) { try { e2.restoreViewState(st); } catch {} }
                 });
               }
               setOpenContent(data.content);
@@ -1101,7 +1104,7 @@ window.__ModuleLoader__.load({
           if (ed && st) {
             requestAnimationFrame(() => {
               const e2 = editorRef.current;
-              if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+              if (e2 && !e2.isDisposed?.() && modelRef.current === model) { try { e2.restoreViewState(st); } catch {} }
             });
           }
           setOpenContent(data.content);
@@ -1171,7 +1174,9 @@ window.__ModuleLoader__.load({
             // a synchronous restore gets overwritten and scroll resets.
             requestAnimationFrame(() => {
               const e2 = editorRef.current;
-              if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+              if (e2 && !e2.isDisposed?.() && modelRef.current === model) {
+                try { e2.restoreViewState(st); } catch {}
+              }
             });
           }
           // Track edits: park the text on EVERY change (tree clicks call
@@ -1444,7 +1449,7 @@ window.__ModuleLoader__.load({
             if (ed && st) {
               requestAnimationFrame(() => {
                 const e2 = editorRef.current;
-                if (e2 && !e2.isDisposed?.() && modelRef.current === model) e2.restoreViewState(st);
+                if (e2 && !e2.isDisposed?.() && modelRef.current === model) { try { e2.restoreViewState(st); } catch {} }
               });
             }
           }
@@ -1858,7 +1863,10 @@ window.__ModuleLoader__.load({
         let current = rootPath;
         const newExpanded = new Set(expanded);
         const loaded = new Set(children.keys());
-        for (const seg of segs) {
+        // Последний сегмент — сам файл: его листинг не нужен (loadDir на файле
+        // падает с ENOTDIR → 400).
+        const dirSegs = segs.length > 1 ? segs.slice(0, -1) : segs;
+        for (const seg of dirSegs) {
           const dirPath = joinPath(current, seg);
           if (!loaded.has(dirPath)) await loadDir(dirPath);
           loaded.add(dirPath);

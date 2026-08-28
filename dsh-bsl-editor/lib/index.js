@@ -537,7 +537,12 @@ const VENDOR_FILES = {
   "workerMain.js": ["workerMain.js", "application/javascript"],
   "onigasm-esm.js": ["onigasm-esm.js", "application/javascript"],
   "monaco-textmate-esm.js": ["monaco-textmate-esm.js", "application/javascript"],
+  "fast-plist-esm.js": ["fast-plist-esm.js", "application/javascript"],
+  "lru-cache-esm.js": ["lru-cache-esm.js", "application/javascript"],
+  "pseudomap-esm.js": ["pseudomap-esm.js", "application/javascript"],
+  "yallist-esm.js": ["yallist-esm.js", "application/javascript"],
   "onigasm.wasm": ["onigasm.wasm", "application/wasm"],
+  "codicon.ttf": ["codicon.ttf", "font/ttf"],
 };
 let vendorDir = null;
 function resolveVendorDir() {
@@ -562,7 +567,9 @@ function handleVendor(_root, url, res) {
   const dir = resolveVendorDir();
   const p = dir ? join(dir, entry[0]) : null;
   if (!p || !existsSync(p)) return json(res, 404, { error: "vendor asset missing" });
-  res.writeHead(200, { "content-type": entry[1], "cache-control": "public, max-age=86400" });
+  // no-cache: файлы правились между версиями; долгий max-age заставлял
+  // браузер сутки держать старые бандлы с несуществующими /npm/ импортами.
+  res.writeHead(200, { "content-type": entry[1], "cache-control": "no-cache" });
   res.end(readFileSync(p));
 }
 
