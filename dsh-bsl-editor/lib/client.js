@@ -1046,6 +1046,15 @@ window.__ModuleLoader__.load({
 
       // mtime на диске на момент загрузки модели — для hot-reload вкладок.
       const modelMtimesRef = useRef(new Map()); // normPath -> mtimeMs
+      // Флаг BOM файла (UTF-8 с BOM у 1С): запоминается при чтении и
+      // передаётся в /bsl/write, чтобы сохранить кодировку файла.
+      const bomRef = useRef(new Map()); // normPath -> bool
+      // Кодировка файла при чтении (utf-8 | windows-1251) — передаётся в
+      // /bsl/write, чтобы cp1251-файлы 1С не портились при пересохранении.
+      const encRef = useRef(new Map()); // normPath -> string
+      // Программная навигация (F12) сама ставит позицию — view-state
+      // восстанавливать не нужно (он перекрыл бы целевой переход).
+      const suppressViewRestoreRef = useRef(false);
       // Путь файла, ожидающего автопереход к первому диффу после открытия.
       const freshOpenPathRef = useRef(null);
       const gotoAnchorRef = useRef(null);
@@ -1068,6 +1077,8 @@ window.__ModuleLoader__.load({
         // но база для сравнения утрачена. Сверяем КОНТЕНТ с диском напрямую.
         const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
         modelMtimesRef.current.set(fullPath, mtime);
+        bomRef.current.set(fullPath, !!data.bom);
+        encRef.current.set(fullPath, data.encoding || "utf-8");
         if (data.content === model.getValue()) return;
         const isDirty = openBuffersRef.current.has(fullPath);
         if (isDirty) {
@@ -1148,6 +1159,11 @@ window.__ModuleLoader__.load({
               fetchJson("/bsl/stat?path=" + encodeURIComponent(fullPath))
                 .then((d) => { modelMtimesRef.current.set(fullPath, d.mtimeMs ?? null); })
                 .catch(() => {});
+              // BOM для parked-моделей тоже нужен (иначе при сохранении
+              // потеряется BOM файла).
+              fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath))
+                .then((d) => { bomRef.current.set(fullPath, !!d.bom); encRef.current.set(fullPath, d.encoding || "utf-8"); })
+                .catch(() => {});
             } else {
               // Первый заход в этой сессии: после отрисовки диффов автопереход
               // к первому блоку изменений.
@@ -1156,6 +1172,8 @@ window.__ModuleLoader__.load({
               model = monaco.editor.createModel(data.content, lang, uri);
               setOpenContent(data.content);
               modelMtimesRef.current.set(fullPath, data.mtimeMs ?? null);
+              bomRef.current.set(fullPath, !!data.bom);
+              encRef.current.set(fullPath, data.encoding || "utf-8");
               if (lspRef.current) {
                 lspRef.current.notify("textDocument/didOpen", {
                   textDocument: { uri: uri.toString(), languageId: "bsl", version: 1, text: data.content },
@@ -1169,13 +1187,13 @@ window.__ModuleLoader__.load({
           modelRef.current = model;
           ed.setModel(model);
           const st = viewStatesRef.current.get(fullPath);
-          if (st) {
+          if (st && !suppressViewRestoreRef.current) {
             // Apply after Monaco recomputes layout for the new model —
             // a synchronous restore gets overwritten and scroll resets.
             requestAnimationFrame(() => {
               const e2 = editorRef.current;
               if (e2 && !e2.isDisposed?.() && modelRef.current === model) {
-                try { e2.restoreViewState(st); } catch {}
+                try { Promise.resolve(e2.restoreViewState(st)).catch(() => {}); } catch {}
               }
             });
           }
@@ -1409,12 +1427,21 @@ window.__ModuleLoader__.load({
         setSaving(true);
         setSaveError("");
         try {
+          const v = model.getValue();
+          console.log("[dsh-bsl] save:", path.split(/[\\/]/).pop(), "len=" + v.length, "U+FFFD=" + (v.match(/\ufffd/g) || []).length, "bom=" + (bomRef.current.get(path) ?? false), "enc=" + (encRef.current.get(path) || "utf-8"));
           const res = await fetch("/bsl/write", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ path, content: model.getValue() }),
+            body: JSON.stringify({
+              path,
+              content: v,
+              bom: bomRef.current.get(path) ?? false,
+              encoding: encRef.current.get(path) || "utf-8",
+            }),
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
+          const rb = await res.json().catch(() => null);
+          if (rb) console.log("[dsh-bsl] write-resp:", JSON.stringify(rb));
           setDirty(false);
           markTabDirty(path, false);
           // Обновить известный mtime: наша же запись на диске не должна
@@ -1603,25 +1630,9 @@ window.__ModuleLoader__.load({
           },
         }));
 
-        disposables.push(monaco.languages.registerDefinitionProvider("bsl", {
-          provideDefinition: async (model, position) => {
-            const uri = model.uri.toString();
-            const res = await lsp.request("textDocument/definition", {
-              textDocument: { uri },
-              position: { line: position.lineNumber - 1, character: position.column - 1 },
-            });
-            if (!res) return null;
-            const loc = Array.isArray(res) ? res[0] : res;
-            if (!loc) return null;
-            return {
-              uri: monaco.Uri.parse(loc.uri),
-              range: new monaco.Range(loc.range.start.line + 1, loc.range.start.character + 1, loc.range.end.line + 1, loc.range.end.character + 1),
-            };
-          },
-        }));
-
-        // Shift+F12 — all usages, including cross-module ones (BSL LS advertises
-        // referencesProvider; the index needs the config to be loaded).
+        // Go-to-definition — только по F12 (см. staticDef ниже): нативный
+        // Ctrl+клик Monaco мешает выделению/копированию, поэтому definition
+        // provider не регистрируем ни для LSP, ни для статики.
         disposables.push(monaco.languages.registerReferenceProvider("bsl", {
           provideReferences: async (model, position, context) => {
             const uri = model.uri.toString();
@@ -1712,7 +1723,8 @@ window.__ModuleLoader__.load({
               const idx = (prev.index + 1) % prev.targets.length;
               prev.index = idx;
               const t = prev.targets[idx];
-              await openFile(t.file);
+              suppressViewRestoreRef.current = true;
+              try { await openFile(t.file); } finally { suppressViewRestoreRef.current = false; }
               const ed = editorRef.current;
               if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
               return null;
@@ -1731,7 +1743,8 @@ window.__ModuleLoader__.load({
             }
             staticNavRef.current = { word, targets, index: 0 };
             const t = targets[0];
-            await openFile(t.file);
+            suppressViewRestoreRef.current = true;
+            try { await openFile(t.file); } finally { suppressViewRestoreRef.current = false; }
             const ed = editorRef.current;
             if (ed) { ed.setPosition({ lineNumber: t.line, column: t.col }); ed.revealPositionInCenter({ lineNumber: t.line, column: t.col }); }
             return null;
@@ -1740,20 +1753,45 @@ window.__ModuleLoader__.load({
             return null;
           }
         };
-        const disp = monaco.languages.registerDefinitionProvider("bsl", { provideDefinition: staticDef });
+        // Definition provider НЕ регистрируем (включает нативный Ctrl+клик) —
+        // переход к определению только по F12.
+        const disp = null;
         // Intercept F12 so Monaco doesn't show its own "No definition found"
         // toast on a miss — we do the navigation (and the toast) ourselves.
         if (!f12BoundRef.current) {
           f12BoundRef.current = editor.addCommand(monaco.KeyCode.F12, () => {
             const ed = editorRef.current;
             if (!ed) return;
-            if (lspRef.current) { ed.trigger(null, "editor.action.revealDefinition", null); return; }
             const m = ed.getModel();
             const pos = ed.getPosition();
-            if (m && pos) staticDef(m, pos);
+            if (!m || !pos) return;
+            if (lspRef.current) {
+              // LSP-ветка: прямой запрос к языковому серверу.
+              lspRef.current.request("textDocument/definition", {
+                textDocument: { uri: m.uri.toString() },
+                position: { line: pos.lineNumber - 1, character: pos.column - 1 },
+              }).then((res) => {
+                if (!res) return;
+                const loc = Array.isArray(res) ? res[0] : res;
+                if (!loc) return;
+                suppressViewRestoreRef.current = true;
+                openFile(decodeURIComponent((/^file:\/\/(?:\/)?(.+)$/.exec(String(loc.uri)) || [])[1] || String(loc.uri)))
+                  .then(() => {
+                    const e2 = editorRef.current;
+                    if (e2) {
+                      e2.setPosition({ lineNumber: loc.range.start.line + 1, column: loc.range.start.character + 1 });
+                      e2.revealPositionInCenter({ lineNumber: loc.range.start.line + 1, column: loc.range.start.character + 1 });
+                    }
+                  })
+                  .catch(() => {})
+                  .finally(() => { suppressViewRestoreRef.current = false; });
+              }).catch(() => {});
+              return;
+            }
+            staticDef(m, pos);
           });
         }
-        return () => disp.dispose();
+        return () => disp?.dispose?.();
       }, [monacoReady, openFile]);
 
       // Restore the tree scroll position once the tree has rendered (children
@@ -2652,6 +2690,34 @@ window.__ModuleLoader__.load({
         ),
       );
 
+      // ── Привязка корня к активной сессии ──────────────────────────────────
+      // DSH's own sidebar resolves the project root from the CURRENT session's
+      // cwd (ctx.sessions.list → byId[current].cwd), not from the workspace
+      // registry order. Follow suit: whenever the active session changes, tell
+      // the host to re-point /bsl/* at that session's cwd.
+      const sessionsList = ctx.sessions?.list;
+      if (sessionsList && typeof sessionsList.subscribe === "function" && typeof fetch === "function") {
+        let lastCwd = "";
+        const syncWorkspace = () => {
+          try {
+            const snap = sessionsList.getSnapshot();
+            const currentId = snap?.current;
+            const cwd = currentId ? snap?.byId?.[currentId]?.cwd : undefined;
+            if (!cwd || cwd === lastCwd) return;
+            lastCwd = cwd;
+            wsRootCache = "";
+            fetch("/bsl/set-workspace", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ cwd }),
+            }).catch(() => {});
+          } catch {}
+        };
+        syncWorkspace();
+        const unsub = sessionsList.subscribe(syncWorkspace);
+        ctx.on("dispose", () => { try { unsub(); } catch {} });
+      }
+
       // ── Перехват открытия файлов из чата (ctx.workspaces.openPath) ──────
       const wsService = ctx.workspaces;
       if (wsService && typeof wsService.openPath === "function") {
@@ -2710,7 +2776,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const inject = ["slots", "workspaces"];
+    const inject = ["slots", "workspaces", "sessions"];
     return { apply, inject };
   },
 });

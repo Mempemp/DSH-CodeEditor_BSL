@@ -287,6 +287,64 @@ async function handleSearch(root, url, res) {
   }
 }
 
+// Декодирование текстового файла: UTF-8 (строго) или Windows-1251.
+// readFileSync("utf-8") МОЛЧА заменяет невалидные байты на U+FFFD — это
+// портит cp1251-файлы 1С при пересохранении; поэтому кодировка
+// определяется явно и сохраняется (handleWrite пишет в той же кодировке).
+const WINDOWS_1251_TO_UNICODE = (() => {
+  // 0x80..0xFF в cp1251 → кодовая точка Unicode (кириллица 0xC0..0xFF
+  // линейна: U+0410..U+044F), спецсимволы 0x80..0xBF — таблица ниже.
+  const map = new Array(128);
+  // 0xC0-0xDF: А..Я (U+0410..U+042F), 0xE0-0xFF: а..я (U+0430..U+044F)
+  for (let b = 0xc0; b <= 0xff; b++) map[b - 0x80] = b < 0xe0 ? 0x410 + (b - 0xc0) : 0x430 + (b - 0xe0);
+  const special = {
+    0x80: 0x402, 0x81: 0x403, 0x82: 0x201a, 0x83: 0x453, 0x84: 0x201e, 0x85: 0x2026,
+    0x86: 0x2020, 0x87: 0x2021, 0x88: 0x20ac, 0x89: 0x2030, 0x8a: 0x409, 0x8b: 0x2039,
+    0x8c: 0x40a, 0x8d: 0x40c, 0x8e: 0x40b, 0x8f: 0x40f, 0x90: 0x452, 0x91: 0x2018,
+    0x92: 0x2019, 0x93: 0x201c, 0x94: 0x201d, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
+    0x98: 0x3f, 0x99: 0x2122, 0x9a: 0x459, 0x9b: 0x203a, 0x9c: 0x45a, 0x9d: 0x45c,
+    0x9e: 0x45b, 0x9f: 0x45f, 0xa0: 0xa0, 0xa1: 0x40e, 0xa2: 0x45e, 0xa3: 0x408,
+    0xa4: 0xa4, 0xa5: 0x490, 0xa6: 0xa6, 0xa7: 0xa7, 0xa8: 0x401, 0xa9: 0xa9,
+    0xaa: 0x404, 0xab: 0xab, 0xac: 0xac, 0xad: 0xad, 0xae: 0xae, 0xaf: 0x407,
+    0xb0: 0xb0, 0xb1: 0xb1, 0xb2: 0x406, 0xb3: 0x456, 0xb4: 0x491, 0xb5: 0xb5,
+    0xb6: 0xb6, 0xb7: 0xb7, 0xb8: 0x451, 0xb9: 0x2116, 0xba: 0x454, 0xbb: 0xbb,
+    0xbc: 0x458, 0xbd: 0x405, 0xbe: 0x455, 0xbf: 0x457,
+  };
+  for (const [b, cp] of Object.entries(special)) map[Number(b) - 0x80] = cp;
+  return map;
+})();
+
+function decodeTextFile(buf) {
+  // Строгий UTF-8: TextDecoder(fatal) бросает на невалидных байтах.
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(buf), encoding: "utf-8" };
+  } catch {}
+  // Windows-1251 — родная кодировка 1С-Конфигуратора для старых файлов.
+  let out = "";
+  for (const b of buf) out += String.fromCharCode(b < 0x80 ? b : WINDOWS_1251_TO_UNICODE[b - 0x80]);
+  return { text: out, encoding: "windows-1251" };
+}
+
+function encodeTextFile(text, encoding) {
+  if (encoding !== "windows-1251") return Buffer.from(text, "utf-8");
+  // Обратная таблица: Unicode → cp1251 (построение лениво, один раз).
+  const unicodeTo1251 = (() => {
+    const rev = new Map();
+    WINDOWS_1251_TO_UNICODE.forEach((cp, i) => { if (!rev.has(cp)) rev.set(cp, i + 0x80); });
+    return rev;
+  })();
+  const bytes = [];
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code < 0x80) bytes.push(code);
+    else {
+      const b = unicodeTo1251.get(code);
+      bytes.push(b ?? 0x3f); // ? — символ вне cp1251
+    }
+  }
+  return Buffer.from(bytes);
+}
+
 async function handleRead(root, url, res, config) {
   const path = url.searchParams.get("path") || "";
   try {
@@ -294,10 +352,16 @@ async function handleRead(root, url, res, config) {
     const st = await fs.stat(abs);
     if (st.isDirectory()) return json(res, 400, { error: "is a directory" });
     const ext = abs.slice(abs.lastIndexOf(".")).toLowerCase();
-    const content = TEXT_EXTENSIONS.has(ext) && st.size < 5 * 1024 * 1024
-      ? readFileSync(abs, "utf-8")
-      : "[binary file]";
-    json(res, 200, { path: abs, content, mtimeMs: st.mtimeMs, size: st.size });
+    if (TEXT_EXTENSIONS.has(ext) && st.size < 5 * 1024 * 1024) {
+      const raw = readFileSync(abs);
+      const { text, encoding } = decodeTextFile(raw);
+      // BOM определяется по сырым байтам: TextDecoder срезает его из текста
+      // автоматически, поэтому по строке его не увидеть.
+      const bom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf;
+      json(res, 200, { path: abs, content: text, bom, encoding, mtimeMs: st.mtimeMs, size: st.size });
+    } else {
+      json(res, 200, { path: abs, content: "[binary file]", bom: false, encoding: "utf-8", mtimeMs: st.mtimeMs, size: st.size });
+    }
   } catch (e) {
     json(res, 400, { error: e.message });
   }
@@ -323,15 +387,17 @@ function runGit(root, args) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
+    let size = 0;
     req.on("data", (c) => {
-      data += c;
-      if (data.length > 16 * 1024 * 1024) {
+      chunks.push(c);
+      size += c.length;
+      if (size > 16 * 1024 * 1024) {
         reject(new Error("body too large"));
         req.destroy();
       }
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
 }
@@ -346,8 +412,26 @@ async function handleWrite(root, req, res) {
     if (st && st.isDirectory()) return json(res, 400, { error: "is a directory" });
     const ext = abs.slice(abs.lastIndexOf(".")).toLowerCase();
     if (!TEXT_EXTENSIONS.has(ext)) return json(res, 400, { error: "not a text file" });
-    await fs.writeFile(abs, content, "utf-8");
-    json(res, 200, { ok: true, path: abs });
+    // Кодировку и BOM берём из САМОГО ФАЙЛА на диске (источник истины):
+    // флаги клиента могут быть устаревшими (быстрый Ctrl+S до ответа read).
+    // Клиентские значения используются только для нового файла (нет на диске).
+    let encoding = "utf-8";
+    let bomFlag = false;
+    if (st) {
+      const head = readFileSync(abs);
+      bomFlag = head.length >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf;
+      try { new TextDecoder("utf-8", { fatal: true }).decode(head); } catch { encoding = "windows-1251"; }
+    } else {
+      bomFlag = body.bom === true;
+      encoding = body.encoding === "windows-1251" ? "windows-1251" : "utf-8";
+    }
+    let text = bomFlag && !content.startsWith("\ufeff") ? "\ufeff" + content : content;
+    await fs.writeFile(abs, encodeTextFile(text, encoding));
+    json(res, 200, {
+      ok: true, path: abs, bom: bomFlag, encoding,
+      clientLen: content.length, clientRepl: (content.match(/\ufffd/g) || []).length,
+      diskLen: st ? st.size : null,
+    });
   } catch (e) {
     json(res, 400, { error: e.message });
   }
@@ -579,6 +663,9 @@ export function apply(ctx, config) {
 
   // The user's project comes from the DSH workspace registry; fall back to dsh
   // cwd only when there is no workspace (never dsh's install dir by accident).
+  // `root` is mutable: the client re-points it at the ACTIVE session's cwd
+  // (POST /bsl/set-workspace) when the user switches chats/workspaces — the
+  // registry's first entry is display order, not the active workspace.
   const workspaces = (() => {
     try {
       return (ctx.workspaceRegistry?.list?.() ?? []).map((w) => ({ id: w.id, path: w.path, title: w.title }));
@@ -586,7 +673,7 @@ export function apply(ctx, config) {
       return [];
     }
   })();
-  const root = config.workspaceDir || (workspaces[0]?.path ?? process.cwd());
+  let root = config.workspaceDir || (workspaces[0]?.path ?? process.cwd());
 
   // Warm the filename index in the background so the first search is instant.
   ensureIndex(root).catch(() => {});
@@ -624,6 +711,26 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/workspaces",
     handler: (_req, res) => json(res, 200, { root, workspaces }),
+  });
+  // The client re-points the editor root at the ACTIVE session's cwd when the
+  // user switches chats/workspaces (session.cwd from the client sessions list).
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/set-workspace",
+    handler: async (req, res) => {
+      try {
+        const body = JSON.parse(await readBody(req));
+        const cwd = String(body?.cwd || "").trim();
+        if (!cwd) return json(res, 400, { ok: false, error: "cwd required" });
+        const st = await fs.stat(cwd).catch(() => null);
+        if (!st?.isDirectory()) return json(res, 400, { ok: false, error: "not a directory: " + cwd });
+        const previous = root;
+        root = cwd.replace(/[\\/]+$/, "");
+        if (root !== previous) ensureIndex(root).catch(() => {});
+        json(res, 200, { ok: true, root });
+      } catch (e) {
+        json(res, 400, { ok: false, error: e?.message || String(e) });
+      }
+    },
   });
   ctx.webServer.register({
     kind: "exact", path: "/bsl/logs",
