@@ -1427,21 +1427,17 @@ window.__ModuleLoader__.load({
         setSaving(true);
         setSaveError("");
         try {
-          const v = model.getValue();
-          console.log("[dsh-bsl] save:", path.split(/[\\/]/).pop(), "len=" + v.length, "U+FFFD=" + (v.match(/\ufffd/g) || []).length, "bom=" + (bomRef.current.get(path) ?? false), "enc=" + (encRef.current.get(path) || "utf-8"));
           const res = await fetch("/bsl/write", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               path,
-              content: v,
+              content: model.getValue(),
               bom: bomRef.current.get(path) ?? false,
               encoding: encRef.current.get(path) || "utf-8",
             }),
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
-          const rb = await res.json().catch(() => null);
-          if (rb) console.log("[dsh-bsl] write-resp:", JSON.stringify(rb));
           setDirty(false);
           markTabDirty(path, false);
           // Обновить известный mtime: наша же запись на диске не должна

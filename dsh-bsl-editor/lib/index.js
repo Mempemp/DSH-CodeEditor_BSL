@@ -427,11 +427,7 @@ async function handleWrite(root, req, res) {
     }
     let text = bomFlag && !content.startsWith("\ufeff") ? "\ufeff" + content : content;
     await fs.writeFile(abs, encodeTextFile(text, encoding));
-    json(res, 200, {
-      ok: true, path: abs, bom: bomFlag, encoding,
-      clientLen: content.length, clientRepl: (content.match(/\ufffd/g) || []).length,
-      diskLen: st ? st.size : null,
-    });
+    json(res, 200, { ok: true, path: abs, bom: bomFlag, encoding });
   } catch (e) {
     json(res, 400, { error: e.message });
   }
