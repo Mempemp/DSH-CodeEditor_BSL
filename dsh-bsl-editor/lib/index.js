@@ -706,7 +706,11 @@ export function apply(ctx, config) {
   });
   ctx.webServer.register({
     kind: "exact", path: "/bsl/workspaces",
-    handler: (_req, res) => json(res, 200, { root, workspaces }),
+    handler: (_req, res) => {
+      const cur = workspaces.find((w) => w.path === root);
+      const title = cur?.title || root.split(/[\\/]/).filter(Boolean).pop() || root;
+      json(res, 200, { root, workspaces, title });
+    },
   });
   // The client re-points the editor root at the ACTIVE session's cwd when the
   // user switches chats/workspaces (session.cwd from the client sessions list).

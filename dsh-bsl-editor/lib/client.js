@@ -44,47 +44,52 @@ window.__ModuleLoader__.load({
       t._timer = setTimeout(() => { t.style.opacity = "0"; }, 2200);
     }
 
-    // Send a code reference into the DSH chat. Reliable path: copy to clipboard
-    // and focus the composer (user pastes). Best-effort: try to insert directly
-    // into the composer's editable (textarea / contenteditable).
-    function sendToChat(text) {
-      // Ссылка идёт с ведущим переносом строки: вставка в непустой композер
-      // не приклеивается к предыдущему тексту.
+    // Client cordis ctx (captured in apply) — reach the composer through its
+    // public provide-channel instead of poking at the DOM.
+    let chatCtx = null;
+
+    // Send a code reference into the DSH chat. Since dsh 0.1.2 the composer
+    // draft lives in a shell-owned Lexical editor — raw DOM insertion into the
+    // contenteditable silently does nothing (no error, draft unchanged), which
+    // is why the old textarea/DOM path "succeeded" without sending anything.
+    // Primary path: conversation.input.setDraft (same provide-channel that
+    // dsh-better-sidebar uses). Fallback: clipboard + composer focus.
+    function sendToChat(sessionId, text) {
+      const inserted = (() => {
+        try {
+          if (!chatCtx || !sessionId) return false;
+          if (typeof chatCtx.sessions?.scope !== "function") return false;
+          const actx = chatCtx.sessions.scope(sessionId);
+          const conversation = chatCtx.get("conversation");
+          if (!actx || !conversation) return false;
+          const input = conversation.input && typeof conversation.input.for === "function"
+            ? conversation.input.for(actx)
+            : undefined;
+          if (!input || typeof input.setDraft !== "function") return false;
+          const snap = input.state && typeof input.state.getSnapshot === "function"
+            ? input.state.getSnapshot()
+            : null;
+          const draft = snap && typeof snap === "object" ? snap.draft || "" : "";
+          // Ссылка с ведущим переносом: в непустом черновике не приклеивается
+          // к предыдущему тексту.
+          input.setDraft(draft ? draft + "\n" + text : text);
+          return true;
+        } catch (e) {
+          console.warn("[dsh-bsl-editor] composer insert failed:", e);
+          return false;
+        }
+      })();
+      if (inserted) {
+        showToast("Ссылка вставлена в чат");
+        return;
+      }
+      // Fallback: clipboard всегда (надёжно), плюс фокус на композер.
       const ref = "\n" + text;
       try { navigator.clipboard?.writeText(ref); } catch {}
-      let inserted = false;
       const seat = document.querySelector("[data-composer-seat]");
       const editable = (seat || document).querySelector('[contenteditable="true"], textarea, [role="textbox"]');
-      if (editable) {
-        editable.focus();
-        try {
-          if (editable.tagName === "TEXTAREA") {
-            const s = editable.selectionStart ?? editable.value.length;
-            const e = editable.selectionEnd ?? s;
-            const atEnd = s >= editable.value.length;
-            const piece = atEnd && editable.value.length > 0 ? ref : text;
-            editable.setRangeText(piece, s, e, "end");
-            editable.dispatchEvent(new Event("input", { bubbles: true }));
-            inserted = true;
-          } else {
-            const sel = window.getSelection();
-            const inEditable = sel && sel.rangeCount > 0 && (editable.contains(sel.anchorNode) || sel.anchorNode === editable);
-            if (inEditable) {
-              const range = sel.getRangeAt(0);
-              range.deleteContents();
-              const node = document.createTextNode(text);
-              range.insertNode(node);
-              range.setStartAfter(node);
-              sel.removeAllRanges();
-              sel.addRange(range);
-              inserted = true;
-            } else if (document.execCommand) {
-              try { inserted = document.execCommand("insertText", false, text); } catch {}
-            }
-          }
-        } catch {}
-      }
-      showToast(inserted ? "Ссылка вставлена в чат" : "Ссылка скопирована — вставьте в чат (Ctrl+V)");
+      if (editable) { try { editable.focus(); } catch {} }
+      showToast("Ссылка скопирована — вставьте в чат (Ctrl+V)");
     }
 
     // Monaco: сначала same-origin vendor (/bsl/vendor), затем CDN как запасной.
@@ -752,7 +757,7 @@ window.__ModuleLoader__.load({
         (async () => {
           try {
             const ws = await fetchJson("/bsl/workspaces");
-            if (alive && ws.workspaces && ws.workspaces[0]) setRootTitle(ws.workspaces[0].title);
+            if (alive && ws.title) setRootTitle(ws.title);
           } catch {}
         })();
         return () => { alive = false; };
@@ -919,7 +924,7 @@ window.__ModuleLoader__.load({
               if (r && rel.toLowerCase().startsWith(r.toLowerCase())) rel = rel.slice(r.length).replace(/^\/+/, "");
               const a = sel.startLineNumber, b = sel.endLineNumber;
               const ref = rel + (a === b ? ":" + a : ":" + a + "-" + b);
-              sendToChat(ref);
+              sendToChat(sessionId, ref);
             },
           });
 
@@ -1915,7 +1920,7 @@ window.__ModuleLoader__.load({
       // чистится при размонтировании. При монтировании применяется очередь
       // pendingOpens — открытия из чата, пришедшие, когда Editor был размонтирован.
       useEffect(() => {
-        editorBridge = { openFile, reveal, ready: monacoReady };
+        editorBridge = { openFile, reveal, ready: monacoReady, setTitle: setRootTitle };
         if (monacoReady && pendingOpens.length) {
           const queue = pendingOpens;
           pendingOpens = [];
@@ -2671,6 +2676,7 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      chatCtx = ctx;
       ctx.slots.inject(
         "conversation.view",
         () => ctx.slots.register(
@@ -2702,11 +2708,24 @@ window.__ModuleLoader__.load({
             if (!cwd || cwd === lastCwd) return;
             lastCwd = cwd;
             wsRootCache = "";
+            // Название воркспейса берём у хоста (title из реестра либо имя папки)
+            // и обновляем шапку дерева — EditorView подхватит через мост.
             fetch("/bsl/set-workspace", {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ cwd }),
-            }).catch(() => {});
+            })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((d) => {
+                if (d?.root) {
+                  fetchJson("/bsl/workspaces").then((w) => {
+                    if (w?.title && editorBridge && typeof editorBridge.setTitle === "function") {
+                      editorBridge.setTitle(w.title);
+                    }
+                  }).catch(() => {});
+                }
+              })
+              .catch(() => {});
           } catch {}
         };
         syncWorkspace();

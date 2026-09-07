@@ -1,6 +1,6 @@
 {
   "name": "dsh-bsl-editor",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "1C:Enterprise (BSL) code editor for DeepSeek Harness: metadata tree of the configuration, Monaco with the official BSL TextMate grammar, static go-to-definition, git change indicators, optional LSP.",
   "keywords": [
     "dsh",
