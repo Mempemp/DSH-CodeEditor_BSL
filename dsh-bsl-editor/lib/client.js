@@ -560,18 +560,22 @@ window.__ModuleLoader__.load({
     }
 
     // Путь из чата → абсолютный канонический путь внутри корня, либо null.
-    // Относительные пути резолвятся против того же root, что и в /bsl/read
-    // хоста (resolveInside): абсолют — как есть, относительный — join(root, p).
-    async function resolveChatPath(raw) {
+    // Относительные пути резолвятся от cwd активной сессии (её же использует
+    // чат в resolveWorkspacePath), с откатом на корень воркспейса; абсолют —
+    // как есть. Проверка принадлежности корню — как в resolveInside хоста.
+    async function resolveChatPath(raw, base) {
       let p = String(raw ?? "").trim();
       if (!p) return null;
       p = p.replace(/^file:\/\/\//, "");
       const root = await getWsRoot();
       if (!root || !/^[a-zA-Z]:[\\/]/.test(root)) return null;
       const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
+      const baseNorm = base && /^[a-zA-Z]:[\\/]/.test(base)
+        ? String(base).replace(/\\/g, "/").replace(/\/+$/, "")
+        : rootNorm;
       let abs = p.replace(/\\/g, "/");
       if (!/^[a-zA-Z]:\//.test(abs)) {
-        abs = rootNorm + "/" + abs.replace(/^\.\//, "").replace(/^\/+/, "");
+        abs = baseNorm + "/" + abs.replace(/^\.\//, "").replace(/^\/+/, "");
       }
       // Схлопнуть "." и "..", затем проверить, что путь не вышел за корень.
       const parts = [];
@@ -1012,12 +1016,16 @@ window.__ModuleLoader__.load({
         }
       }, [expanded, children, loadDir]);
 
+      // Зеркало gitFiles для кода вне React-рендера (разметка диффа и
+      // распознавание «файл ещё не в git»).
+      const gitFilesRef = useRef(new Map());
       const refreshGit = useCallback(async () => {
         try {
           const data = await fetchJson("/bsl/git-status");
           if (data.ok) {
             const m = new Map();
             for (const f of data.files) m.set(f.path, f.status);
+            gitFilesRef.current = m;
             setGitFiles(m);
           }
         } catch {}
@@ -1327,6 +1335,17 @@ window.__ModuleLoader__.load({
           const old = decorationIdsRef.current;
           decorationIdsRef.current = editorRef.current.deltaDecorations(old, decorations);
           const parsed = parseUnifiedDiff(diff);
+          // Файл ещё не в git (новый объект): базы для diff нет, значит diff
+          // пуст — без этого свежесохранённый файл выглядит «без изменений».
+          // Помечаем все строки как добавленные (gutter как в VS Code).
+          const relPath = (() => {
+            let s = normPath(path);
+            const r = normPath(rootPathRef.current || "");
+            if (r && s.toLowerCase().startsWith(r.toLowerCase())) s = s.slice(r.length).replace(/^\/+/, "");
+            return s;
+          })();
+          const isNewUntracked = !diff.trim() && String(gitFilesRef.current.get(relPath) || "").includes("?");
+          if (isNewUntracked) for (let ln = 1; ln <= lineCount; ln++) parsed.addedLines.add(ln);
           const addedDecorations = [...parsed.addedLines].sort((a, b) => a - b).map((ln) => ({
             range: new monaco.Range(ln, 1, ln, 1),
             options: { isWholeLine: true, className: "bsl-git-added-line", linesDecorationsClassName: "bsl-git-added" },
@@ -1403,8 +1422,8 @@ window.__ModuleLoader__.load({
             w = { dom, label };
             diffWidgetRef.current = w;
           }
-          w.dom.style.display = mergedAnchors.length ? "inline-flex" : "none";
-          w.label.textContent = mergedAnchors.length ? "1 / " + mergedAnchors.length : "";
+          w.dom.style.display = (mergedAnchors.length || isNewUntracked) ? "inline-flex" : "none";
+          w.label.textContent = isNewUntracked ? "новый файл" : (mergedAnchors.length ? "1 / " + mergedAnchors.length : "");
           // Свежеоткрытый файл с диффами: сразу позиционируем на первый блок.
           // Признак свежести сбрасываем по факту ЛЮБОГО завершённого refresh
           // этого файла: если диффов не было, флаг не должен дожить до первой
@@ -1452,12 +1471,16 @@ window.__ModuleLoader__.load({
             modelMtimesRef.current.set(path, st.mtimeMs ?? null);
           } catch {}
           refreshGitDecorations(path);
+          // Бейджи в дереве и список «Изменённые» берут данные из
+          // /bsl/git-status — без обновления сохранённый файл не появится там
+          // до следующего триггера (хост сбрасывает свой кэш на записи).
+          refreshGit();
         } catch (e) {
           setSaveError(e?.message || String(e));
         } finally {
           setSaving(false);
         }
-      }, [saving, refreshGitDecorations]);
+      }, [saving, refreshGitDecorations, refreshGit]);
       const saveFileRef = useRef(null);
       saveFileRef.current = saveFile;
 
@@ -1492,10 +1515,11 @@ window.__ModuleLoader__.load({
           setDirty(false);
           setSaveError("");
           refreshGitDecorations(path);
+          refreshGit();
         } catch (e) {
           setSaveError(e?.message || String(e));
         }
-      }, [markTabDirty, refreshGitDecorations]);
+      }, [markTabDirty, refreshGitDecorations, refreshGit]);
       const revertFileRef = useRef(null);
       revertFileRef.current = revertFile;
 
@@ -1717,6 +1741,12 @@ window.__ModuleLoader__.load({
         const staticDef = async (model, position) => {
           if (lspRef.current) return null; // LSP provider handles it
           try {
+            // F12 осмыслен только для BSL: в XML/.md определений нет, и раньше
+            // это выглядело как «клавиша не работает» без единого сообщения.
+            if (model.getLanguageId?.() !== "bsl") {
+              console.info("[dsh-bsl-editor] F12: файл не на BSL (" + (model.getLanguageId?.() || "?") + ") — переход к определению недоступен");
+              return null;
+            }
             const word = wordAt(model, position);
             if (!word) return null;
             const prev = staticNavRef.current;
@@ -1740,6 +1770,7 @@ window.__ModuleLoader__.load({
             const targets = res.targets || [];
             if (!targets.length) {
               staticNavRef.current = null;
+              console.info("[dsh-bsl-editor] F12: определение не найдено — «" + word + "» (" + curFile + ")");
               return null;
             }
             staticNavRef.current = { word, targets, index: 0 };
@@ -1827,7 +1858,7 @@ window.__ModuleLoader__.load({
       }, [loadDir, refreshGit]);
       useEffect(() => {
         if (cfg) refreshGit();
-      }, [cfg?.showUntracked, cfg?.lspEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
+      }, [cfg?.lspEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
 
       // Restore the previously open file + caret after Monaco is ready.
       const restoreDoneRef = useRef(false);
@@ -2105,7 +2136,7 @@ window.__ModuleLoader__.load({
         }
         const st = gitFiles.get(rel);
         if (!st) return null;
-        return jsx("span", { style: { color: st === "M" ? "#e2c08d" : st === "A" ? "#4caf50" : st === "D" ? "#f44336" : "#8a8a8a", marginLeft: 6, fontSize: 11 }, children: st || "?" });
+        return jsx("span", { style: { color: gitStatusColor(st), marginLeft: 6, fontSize: 11 }, children: gitStatusLabel(st) });
       };
 
       const renderLevel = (dirPath, depth) => {
@@ -2214,7 +2245,10 @@ window.__ModuleLoader__.load({
         { key: null, label: "Все файлы" },
         { key: "*", label: "Изменённые" },
       ];
-      const gitStatusColor = (st) => st === "M" ? "#e2c08d" : st === "A" ? "#4caf50" : st === "D" ? "#f44336" : "#8a94a6";
+      // «??» и «A» — новый файл: показываем как «+» зелёным.
+      const isNewStatus = (st) => String(st).includes("?") || String(st).trim() === "A";
+      const gitStatusColor = (st) => isNewStatus(st) ? "#4caf50" : String(st).includes("D") ? "#f44336" : String(st).includes("M") ? "#e2c08d" : "#8a94a6";
+      const gitStatusLabel = (st) => isNewStatus(st) ? "+" : String(st).trim();
       // "*" matches any porcelain status (incl. combined "AM"/"A?" forms).
       const statusMatches = (st, f) => f === "*" ? !!st : f === "??" ? st.includes("?") : st.split("").some((ch) => ch === f);
       const applyGitFilter = (key) => {
@@ -2289,7 +2323,7 @@ window.__ModuleLoader__.load({
               iconBox(coloredFile(name)),
               jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: name }),
               jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }, children: rel }),
-              jsx("span", { style: { flexShrink: 0, color: gitStatusColor(st), fontSize: 11, width: 18, textAlign: "right" }, children: st }),
+              jsx("span", { style: { flexShrink: 0, color: gitStatusColor(st), fontSize: 11, width: 18, textAlign: "right" }, children: gitStatusLabel(st) }),
             ],
           });
         });
@@ -2618,7 +2652,7 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", showUntracked: false, interceptChatOpen: true });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", interceptChatOpen: true });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
@@ -2626,16 +2660,16 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, []);
       React.useEffect(() => {
-        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", showUntracked: cfg.showUntracked === true, interceptChatOpen: cfg.interceptChatOpen !== false });
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false });
       }, [cfg]);
       const save = async () => {
         try {
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked, interceptChatOpen: form.interceptChatOpen }),
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen }),
           });
-          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, showUntracked: form.showUntracked, interceptChatOpen: form.interceptChatOpen }));
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen }));
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } catch (e) {
@@ -2648,10 +2682,6 @@ window.__ModuleLoader__.load({
         jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
           jsx("input", { type: "checkbox", checked: form.lspEnabled, onChange: (e) => setForm((f) => ({ ...f, lspEnabled: e.target.checked })) }),
           "LSP (диагностика, автодополнение, переходы)",
-        ]}),
-        jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
-          jsx("input", { type: "checkbox", checked: form.showUntracked, onChange: (e) => setForm((f) => ({ ...f, showUntracked: e.target.checked })) }),
-          "Показывать в изменениях untracked-файлы (не добавленные в git)",
         ]}),
         jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
           jsx("input", { type: "checkbox", checked: form.interceptChatOpen, onChange: (e) => setForm((f) => ({ ...f, interceptChatOpen: e.target.checked })) }),
@@ -2733,62 +2763,151 @@ window.__ModuleLoader__.load({
         ctx.on("dispose", () => { try { unsub(); } catch {} });
       }
 
-      // ── Перехват открытия файлов из чата (ctx.workspaces.openPath) ──────
-      const wsService = ctx.workspaces;
-      if (wsService && typeof wsService.openPath === "function") {
-        // Базовый оригинал сохраняется ОДИН раз: при перевооружении и на
-        // dispose восстанавливаем именно его, а не чужую промежуточную обёртку.
-        const baseOriginal = wsService.openPath;
-        let installed = null;
-        let interceptOn = true;
-        const refreshCfg = () => {
-          fetchJson("/bsl/config").then((c) => { interceptOn = c.interceptChatOpen !== false; }).catch(() => {});
+      // ── Перехват открытия файлов из чата ─────────────────────────────────
+      // Фуннель чата — remote.session.openWorkspacePath({ path }) (DSH 0.1.2+):
+      // через него идут ссылки из tool-строк, упоминания в тексте и
+      // produced-files. Своё забираем ТОЛЬКО для .bsl/.xml, остальное уходит
+      // дальше — в обёртку dsh-better-sidebar, а без неё в приложение ОС.
+      const CHAT_OPEN_EXT = [".bsl", ".xml"];
+      const wantsChatOpen = (p) => {
+        const s = String(p || "").split(/[?#]/)[0].toLowerCase();
+        const i = s.lastIndexOf(".");
+        return i >= 0 && CHAT_OPEN_EXT.includes(s.slice(i));
+      };
+      // «Показать в папке» передаёт "." / "<cwd>/." — это не файл.
+      const isFolderReveal = (p) => {
+        const s = String(p || "");
+        if (s === "." || s === "./") return true;
+        const t = s.replace(/[\\/]+$/, "");
+        return t === "." || /[\\/]\.$/.test(t);
+      };
+      let interceptOn = true;
+      const refreshCfg = () => {
+        fetchJson("/bsl/config").then((c) => { interceptOn = c.interceptChatOpen !== false; }).catch(() => {});
+      };
+      refreshCfg();
+
+      // cwd активной сессии — та же база, от которой чат резолвит пути.
+      const sessionCwd = () => {
+        try {
+          const snap = ctx.sessions?.list?.getSnapshot?.();
+          const id = snap?.current;
+          const cwd = id ? snap?.byId?.[id]?.cwd : "";
+          return typeof cwd === "string" ? cwd : "";
+        } catch { return ""; }
+      };
+
+      // Открытие в нашем редакторе. Editor может быть размонтирован (активна
+      // вкладка чата) — тогда путь ждёт в pendingOpens и применяется при
+      // монтировании.
+      const openInEditor = (target) => {
+        const bridge = editorBridge;
+        if (bridge && typeof bridge.openFile === "function") {
+          bridge.openFile(target);
+          if (typeof bridge.reveal === "function") bridge.reveal(target);
+          setTimeout(switchToEditorTab, 80);
+          return true;
+        }
+        pendingOpens.push(target);
+        switchToEditorTab();
+        return true;
+      };
+
+      const takeOver = async (rawPath) => {
+        if (!interceptOn) return false;
+        const raw = String(rawPath ?? "").trim();
+        if (!raw || isFolderReveal(raw) || !wantsChatOpen(raw)) return false;
+        const target = await resolveChatPath(raw, sessionCwd());
+        if (!target) return false;
+        return openInEditor(target);
+      };
+      // Конверт remote-вызова: ChatView проверяет result.ok и на провале
+      // показывает диалог ошибки — успешный перехват обязан вернуть его же.
+      const OPENED = () => ({ ok: true, value: { opened: true } });
+
+      // Само-перевооружение: поверх нашей обёртки может встать чужая
+      // (dsh-better-sidebar ставит свою через Object.defineProperty на том же
+      // сервисе), а снаружи оказывается последняя — периодически
+      // заворачиваемся вокруг текущей.
+      const armService = (svc, key, makeWrapped, restore) => {
+        let installed = makeWrapped(svc[key]);
+        const put = (fn) => {
+          try {
+            Object.defineProperty(svc, key, { configurable: true, enumerable: true, writable: true, value: fn });
+          } catch { svc[key] = fn; }
         };
-        refreshCfg();
-
-        const makeWrapper = (current) => async function interceptedOpenPath(path) {
-          if (interceptOn) {
-            try {
-              const target = await resolveChatPath(path);
-              const bridge = editorBridge;
-              if (target && bridge && typeof bridge.openFile === "function") {
-                bridge.openFile(target);
-                if (typeof bridge.reveal === "function") bridge.reveal(target);
-                setTimeout(switchToEditorTab, 80);
-                return undefined;
-              }
-              // Editor не смонтирован (активна вкладка чата): запоминаем путь
-              // и переключаем вкладку — монтирование применит pendingOpens.
-              if (target) {
-                pendingOpens.push(target);
-                switchToEditorTab();
-                return undefined;
-              }
-            } catch (e) {
-              console.error("[dsh-bsl-editor] chat open", e);
-            }
-          }
-          return current.call(wsService, path);
-        };
-
-        installed = makeWrapper(baseOriginal);
-        wsService.openPath = installed;
-
-        // Само-перевооружение: если поверх нашей обёртки кто-то установил
-        // свою (dsh-better-sidebar и т.п.) — заворачиваемся вокруг текущей.
-        const rearmTimer = setInterval(() => {
+        put(installed);
+        const timer = setInterval(() => {
           refreshCfg();
-          if (wsService.openPath !== installed) {
-            installed = makeWrapper(wsService.openPath);
-            wsService.openPath = installed;
+          if (svc[key] !== installed) {
+            installed = makeWrapped(svc[key]);
+            put(installed);
           }
         }, 2500);
+        return () => {
+          clearInterval(timer);
+          if (svc[key] === installed) restore();
+        };
+      };
 
-        ctx.on("dispose", () => {
-          clearInterval(rearmTimer);
-          if (wsService.openPath === installed) wsService.openPath = baseOriginal;
+      const makeRemoteWrapper = (svc, current) => function interceptedOpenWorkspacePath(request, signal) {
+        const raw = request && typeof request === "object" ? request.path : request;
+        return (async () => {
+          try {
+            if (await takeOver(raw)) return OPENED();
+          } catch (e) {
+            console.error("[dsh-bsl-editor] chat open", e);
+          }
+          return current.call(svc, request, signal);
+        })();
+      };
+      const makeOpenPathWrapper = (svc, current) => async function interceptedOpenPath(path) {
+        try {
+          if (await takeOver(path)) return undefined;
+        } catch (e) {
+          console.error("[dsh-bsl-editor] chat open", e);
+        }
+        return current.call(svc, path);
+      };
+
+      const chatOpenDisposers = [];
+
+      // 1) Современная фуннель: remote.session.openWorkspacePath. Сервис
+      // монтируется асинхронно и пересоздаётся при remount, поэтому обёртку
+      // ставим лениво — тем же тиком, что и перевооружение.
+      const getService = (name) => {
+        try { return typeof ctx.get === "function" ? ctx.get(name) : undefined; } catch { return undefined; }
+      };
+      const getRemoteSession = () => getService("remote.session") || ctx.remote?.session;
+      let remoteArmed = null;
+      const ensureRemoteArmed = () => {
+        const svc = getRemoteSession();
+        if (!svc || typeof svc.openWorkspacePath !== "function") return;
+        if (remoteArmed && remoteArmed.svc === svc) return;
+        if (remoteArmed) { try { remoteArmed.dispose(); } catch {} }
+        const desc = Object.getOwnPropertyDescriptor(svc, "openWorkspacePath");
+        const prev = svc.openWorkspacePath;
+        const dispose = armService(svc, "openWorkspacePath", (current) => makeRemoteWrapper(svc, current), () => {
+          if (desc) { try { Object.defineProperty(svc, "openWorkspacePath", desc); return; } catch {} }
+          svc.openWorkspacePath = prev;
         });
+        remoteArmed = { svc, dispose };
+      };
+      ensureRemoteArmed();
+      const armTimer = setInterval(() => { refreshCfg(); ensureRemoteArmed(); }, 2500);
+      chatOpenDisposers.push(() => {
+        clearInterval(armTimer);
+        if (remoteArmed) { try { remoteArmed.dispose(); } catch {} remoteArmed = null; }
+      });
+
+      // 2) Легаси-фуннель более старых ядер: ctx.workspaces.openPath.
+      const wsService = ctx.workspaces;
+      if (wsService && typeof wsService.openPath === "function") {
+        const prev = wsService.openPath;
+        chatOpenDisposers.push(armService(wsService, "openPath", (current) => makeOpenPathWrapper(wsService, current), () => { wsService.openPath = prev; }));
       }
+
+      ctx.on("dispose", () => { for (const d of chatOpenDisposers) { try { d(); } catch {} } });
     }
 
     const inject = ["slots", "workspaces", "sessions"];

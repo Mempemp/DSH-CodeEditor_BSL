@@ -29,9 +29,7 @@ export const Config = z.object({
   sourceExtensions: z.array(z.string()).default([".bsl", ".os"]),
   /** LSP master switch; off by default — unstable on large configurations. */
   lspEnabled: z.boolean().default(false),
-  /** Include git-untracked files in the «Изменённые» tree filter. */
-  showUntracked: z.boolean().default(true),
-  /** Intercept chat file-link clicks (ctx.workspaces.openPath) into this editor. */
+  /** Intercept chat file-link clicks (remote.session.openWorkspacePath). */
   interceptChatOpen: z.boolean().default(true),
 });
 
@@ -273,13 +271,22 @@ async function handleSearch(root, url, res) {
         handleGitStatus(root, { writeHead: () => {}, end: (b) => resolve(JSON.parse(b)) }, null).catch(reject);
         setTimeout(() => reject(new Error("git status timeout")), 5000);
       });
-      changedSet = new Set((st?.files || []).map((f) => f.path.replace(/\\/g, "/")));
+      changedSet = new Set((st?.files || []).map((f) => String(f.path || "").replace(/\\/g, "/").replace(/\/+$/, "")));
     } catch { changedSet = new Set(); }
   }
   try {
     const entries = await ensureIndex(root);
-    let results = entries.filter((e) => e.name.toLowerCase().includes(q));
-    if (changedSet) results = results.filter((e) => changedSet.has(e.rel));
+    // Ищем и по имени, и по полному пути: запрос «загру» должен находить
+    // Module.bsl внутри Forms/ФормаЗагрузки, а не только файлы с «Загруз» в
+    // имени. Совпадения по имени ранжируются выше совпадений по пути.
+    const hits = [];
+    for (const e of entries) {
+      const byName = e.name.toLowerCase().includes(q);
+      if (byName || (e.rel && e.rel.toLowerCase().includes(q))) hits.push({ e, rank: byName ? 0 : 1 });
+    }
+    hits.sort((a, b) => a.rank - b.rank);
+    let results = hits.map((h) => h.e);
+    if (changedSet) results = results.filter((e) => changedSet.has(String(e.rel).replace(/\/+$/, "")));
     results = results.slice(0, 200);
     json(res, 200, { root, query: q, results });
   } catch (e) {
@@ -427,6 +434,11 @@ async function handleWrite(root, req, res) {
     }
     let text = bomFlag && !content.startsWith("\ufeff") ? "\ufeff" + content : content;
     await fs.writeFile(abs, encodeTextFile(text, encoding));
+    // Сохранение могло изменить git-статус (M / ?? / чисто): сбрасываем кэш
+    // статусов и помечаем индекс имён устаревшим, иначе свежий файл не виден
+    // ни в дереве, ни в режиме «Изменённые».
+    gitStatusCache.delete(root);
+    searchIndex.builtAt = 0;
     json(res, 200, { ok: true, path: abs, bom: bomFlag, encoding });
   } catch (e) {
     json(res, 400, { error: e.message });
@@ -437,20 +449,27 @@ async function handleWrite(root, req, res) {
 // на каждый клик по дереву метаданных в режиме фильтра.
 let gitStatusCache = new Map(); // root -> { at, files }
 const GIT_STATUS_TTL = 5000;
-async function handleGitStatus(root, res, config) {
-  // Untracked entries ("?? path") are opt-in: most of the time they are noise.
+async function handleGitStatus(root, res) {
   const cached = gitStatusCache.get(root);
-  if (cached && Date.now() - cached.at < GIT_STATUS_TTL && (cached.showUntracked || !config?.showUntracked)) {
+  if (cached && Date.now() - cached.at < GIT_STATUS_TTL) {
     return json(res, 200, { ok: true, files: cached.files });
   }
-  const r = runGit(root, ["status", "--porcelain", "-z", ...(config?.showUntracked ? [] : ["--untracked-files=no"])]);
+  // Новые файлы показываем всегда: --untracked-files=all перечисляет их
+  // поштучно вместо свёртки каталога в одну строку "?? dir/".
+  const r = runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
   if (!r.ok) return json(res, 200, { ok: false, files: [] });
-  const files = r.output.split("\0").filter(Boolean).map((line) => {
+  const files = [];
+  const parts = r.output.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const line = parts[i];
+    if (!line || line.length < 4) continue;
     const status = line.slice(0, 2).trim();
-    const path = line.slice(3);
-    return { status, path };
-  });
-  gitStatusCache.set(root, { at: Date.now(), showUntracked: !!config?.showUntracked, files });
+    const path = line.slice(3).replace(/\\/g, "/").replace(/\/+$/, "");
+    if (path) files.push({ status, path });
+    // Переименование/копия: следующая часть — исходный путь, пропускаем её.
+    if (status.startsWith("R") || status.startsWith("C")) i += 1;
+  }
+  gitStatusCache.set(root, { at: Date.now(), files });
   json(res, 200, { ok: true, files });
 }
 
@@ -747,7 +766,6 @@ export function apply(ctx, config) {
     kind: "exact", path: "/bsl/config",
     handler: (_req, res) => json(res, 200, {
       lspEnabled: config.lspEnabled,
-      showUntracked: config.showUntracked !== false,
       interceptChatOpen: config.interceptChatOpen !== false,
       serverPort: config.serverPort,
       serverBin: config.serverBin,
@@ -765,7 +783,6 @@ export function apply(ctx, config) {
           const patch = JSON.parse(body || "{}");
           const next = {
             lspEnabled: patch.lspEnabled ?? config.lspEnabled,
-            showUntracked: patch.showUntracked ?? (config.showUntracked !== false),
             interceptChatOpen: patch.interceptChatOpen ?? (config.interceptChatOpen !== false),
             serverPort: patch.serverPort ?? config.serverPort,
             serverBin: patch.serverBin ?? config.serverBin,
