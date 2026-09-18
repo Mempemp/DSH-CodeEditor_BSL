@@ -898,6 +898,20 @@ window.__ModuleLoader__.load({
             fontSize: 14,
             scrollBeyondLastLine: false,
             padding: { top: 0, bottom: composerClearance },
+            // Кириллица в русском BSL-коде для Monaco — «ambiguous unicode»
+            // (А/В/С/Е/О/Р похожи на латинские) и «non-basic ASCII», поэтому над
+            // редактором висит баннер на каждом файле с русскими комментариями и
+            // строками запросов. Обе проверки выключаем. Подсветку невидимых
+            // символов (неразрывный пробел, zero-width) оставляем включённой:
+            // в 1С они действительно ломают код и ищутся глазами плохо.
+            // Опция принимается ТОЛЬКО вложенным объектом (IUnicodeHighlightOptions
+            // из monaco.d.ts): плоские ключи вида "unicodeHighlight.ambiguousCharacters"
+            // валидатор опций молча игнорирует, и баннер остаётся.
+            unicodeHighlight: {
+              ambiguousCharacters: false,
+              nonBasicASCII: false,
+              invisibleCharacters: true,
+            },
           });
           editorRef.current = editor;
           if (alive) setMonacoReady(true);
@@ -2450,6 +2464,45 @@ window.__ModuleLoader__.load({
             scrollbarWidth: "thin",
           },
           children: [
+            // Кнопки файла (перечитать с диска / сохранить) держим в ЛЕВОМ углу
+            // полосы вкладок: правый верхний угол панели занимает плашка
+            // MCP-менеджера (position:absolute, top≈44px, right≈14px; её
+            // положение настраивается в самом плагине, но настройка у него не
+            // сохраняется) — раньше она закрывала эти кнопки. sticky left:0 —
+            // чтобы кнопки не уезжали при горизонтальной прокрутке вкладок.
+            openPath ? jsxs("div", { style: { position: "sticky", left: 0, zIndex: 2, flexShrink: 0, display: "flex", alignItems: "center", gap: 8, marginRight: 8, background: "var(--dsw-alias-bg-layer-2)" }, children: [
+              saveError ? jsx("span", { style: { color: "#f44336" }, title: saveError, children: "✕ ошибка сохранения" }) : null,
+              jsx("button", {
+                onClick: () => revertFileRef.current?.(),
+                title: "Перечитать с диска — сбросить несохранённые изменения (" + openPath + ")",
+                style: {
+                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 20, height: 20, border: "none", borderRadius: 6,
+                  cursor: "pointer", background: "transparent", color: "#8a94a6",
+                  padding: 0, opacity: dirty ? 1 : 0.55,
+                },
+                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                  jsx("polyline", { points: "23 4 23 10 17 10" }),
+                  jsx("path", { d: "M20.49 15a9 9 0 1 1-2.12-9.36L23 10" }),
+                ] }),
+              }),
+              jsx("button", {
+                onClick: () => saveFileRef.current?.(),
+                title: saving ? "Сохранение…" : dirty ? "Сохранить (Ctrl+S) — " + openPath : "Сохранено",
+                disabled: saving,
+                style: {
+                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 20, height: 20, border: "none", borderRadius: 6, cursor: saving ? "wait" : "pointer",
+                  background: "transparent", color: dirty ? "var(--dsw-alias-state-business-primary, #4a9eff)" : "#8a94a6",
+                  padding: 0, opacity: dirty || saving ? 1 : 0.55,
+                },
+                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                  jsx("path", { d: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" }),
+                  jsx("polyline", { points: "17 21 17 13 7 13 7 21" }),
+                  jsx("polyline", { points: "7 3 7 8 15 8" }),
+                ] }),
+              }),
+            ] }) : null,
             tabs.length === 0 ? jsx("span", { style: { opacity: 0.5, padding: "0 6px" }, children: "Нет открытых файлов" }) : null,
             tabs.map((p) => {
               const isTabDirty = tabDirty.has(p);
@@ -2492,39 +2545,6 @@ window.__ModuleLoader__.load({
                 ],
               });
             }),
-            openPath ? jsxs("div", { style: { marginLeft: "auto", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }, children: [
-              saveError ? jsx("span", { style: { color: "#f44336" }, title: saveError, children: "✕ ошибка сохранения" }) : null,
-              jsx("button", {
-                onClick: () => revertFileRef.current?.(),
-                title: "Перечитать с диска — сбросить несохранённые изменения (" + openPath + ")",
-                style: {
-                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 20, height: 20, border: "none", borderRadius: 6,
-                  cursor: "pointer", background: "transparent", color: "#8a94a6",
-                  padding: 0, opacity: dirty ? 1 : 0.55,
-                },
-                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
-                  jsx("polyline", { points: "23 4 23 10 17 10" }),
-                  jsx("path", { d: "M20.49 15a9 9 0 1 1-2.12-9.36L23 10" }),
-                ] }),
-              }),
-              jsx("button", {
-                onClick: () => saveFileRef.current?.(),
-                title: saving ? "Сохранение…" : dirty ? "Сохранить (Ctrl+S) — " + openPath : "Сохранено",
-                disabled: saving,
-                style: {
-                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 20, height: 20, border: "none", borderRadius: 6, cursor: saving ? "wait" : "pointer",
-                  background: "transparent", color: dirty ? "var(--dsw-alias-state-business-primary, #4a9eff)" : "#8a94a6",
-                  padding: 0, opacity: dirty || saving ? 1 : 0.55,
-                },
-                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
-                  jsx("path", { d: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" }),
-                  jsx("polyline", { points: "17 21 17 13 7 13 7 21" }),
-                  jsx("polyline", { points: "7 3 7 8 15 8" }),
-                ] }),
-              }),
-            ] }) : null,
           ],
         }),
         jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
@@ -2813,11 +2833,11 @@ window.__ModuleLoader__.load({
         return true;
       };
 
-      const takeOver = async (rawPath) => {
+      const takeOver = async (rawPath, cwdOverride) => {
         if (!interceptOn) return false;
         const raw = String(rawPath ?? "").trim();
         if (!raw || isFolderReveal(raw) || !wantsChatOpen(raw)) return false;
-        const target = await resolveChatPath(raw, sessionCwd());
+        const target = await resolveChatPath(raw, cwdOverride || sessionCwd());
         if (!target) return false;
         return openInEditor(target);
       };
@@ -2837,13 +2857,18 @@ window.__ModuleLoader__.load({
           } catch { svc[key] = fn; }
         };
         put(installed);
+        // TODO: убрать периодическую перепроверку, когда в dsh появится официальный
+        // хук открытия файлов из чата (сегодня это подмена метода сервиса, и её
+        // приходится переставлять после каждого remount/чужой обёртки). До тех пор
+        // тик раз в 30 с: окно, в которое клик может уйти мимо редактора, — до
+        // получаса кликов это единицы, а лишних запросов к /bsl/config больше нет.
         const timer = setInterval(() => {
           refreshCfg();
           if (svc[key] !== installed) {
             installed = makeWrapped(svc[key]);
             put(installed);
           }
-        }, 2500);
+        }, 30000);
         return () => {
           clearInterval(timer);
           if (svc[key] === installed) restore();
@@ -2894,7 +2919,9 @@ window.__ModuleLoader__.load({
         remoteArmed = { svc, dispose };
       };
       ensureRemoteArmed();
-      const armTimer = setInterval(() => { refreshCfg(); ensureRemoteArmed(); }, 2500);
+      // TODO: см. armService — временный опрос вместо официального хука; снять,
+      // когда перехват переедет на API dsh.
+      const armTimer = setInterval(() => { refreshCfg(); ensureRemoteArmed(); ensureSidebarArmed(); }, 30000);
       chatOpenDisposers.push(() => {
         clearInterval(armTimer);
         if (remoteArmed) { try { remoteArmed.dispose(); } catch {} remoteArmed = null; }
@@ -2906,6 +2933,70 @@ window.__ModuleLoader__.load({
         const prev = wsService.openPath;
         chatOpenDisposers.push(armService(wsService, "openPath", (current) => makeOpenPathWrapper(wsService, current), () => { wsService.openPath = prev; }));
       }
+
+      // 3) Фуннель ядра 0.1.5-rc: чат отдаёт файл правому сайдбару адресом
+      //    dsh-resource://file/session/<id>/<путь> (sidebarRight.openResource).
+      //    Своё (.bsl/.xml) забираем в редактор, остальное (картинки, pdf, чужие
+      //    форматы) уходит дальше — в сайдбар (better-sidebar).
+      const FILE_ADDR_PREFIX = "dsh-resource://file/";
+      const parseFileAddress = (address) => {
+        try {
+          const s = String(address ?? "");
+          if (!s.startsWith(FILE_ADDR_PREFIX)) return null;
+          const end = s.search(/[?#]/);
+          const [scope, ...rest] = s.slice(FILE_ADDR_PREFIX.length, end === -1 ? undefined : end).split("/");
+          if (scope === "session") {
+            const [id, ...segments] = rest;
+            if (!id || !segments.length) return null;
+            return { scope, sessionId: decodeURIComponent(id), path: segments.map(decodeURIComponent).join("/") };
+          }
+          if (scope === "absolute") {
+            const unc = rest[0] === "" && rest.length > 1;
+            const segments = (unc ? rest.slice(1) : rest).map(decodeURIComponent);
+            if (!segments.length || segments[0] === "") return null;
+            const joined = segments.join("/");
+            if (unc) return { scope, path: "//" + joined };
+            return { scope, path: /^[A-Za-z]:$/.test(segments[0]) ? joined : "/" + joined };
+          }
+          return null;
+        } catch { return null; }
+      };
+      const cwdOfSession = (sessionId) => {
+        try {
+          const snap = ctx.sessions?.list?.getSnapshot?.();
+          const cwd = snap?.byId?.[sessionId]?.cwd;
+          return typeof cwd === "string" ? cwd : "";
+        } catch { return ""; }
+      };
+      const makeSidebarWrapper = (svc, current) => async function interceptedOpenResource(address, options) {
+        try {
+          const parsed = parseFileAddress(address);
+          // Относительный путь резолвим от cwd ТОЙ сессии, чей адрес пришёл:
+          // клик приходит в контексте сессии чата, а не текущей вкладки.
+          if (parsed && await takeOver(parsed.path, parsed.scope === "session" ? cwdOfSession(parsed.sessionId) : "")) return;
+        } catch (e) {
+          console.error("[dsh-bsl-editor] sidebar open", e);
+        }
+        return current.call(svc, address, options);
+      };
+      let sidebarArmed = null;
+      const ensureSidebarArmed = () => {
+        const svc = getService("sidebarRight");
+        if (!svc || typeof svc.openResource !== "function") return;
+        if (sidebarArmed && sidebarArmed.svc === svc) return;
+        if (sidebarArmed) { try { sidebarArmed.dispose(); } catch {} }
+        const desc = Object.getOwnPropertyDescriptor(svc, "openResource");
+        const prev = svc.openResource;
+        const dispose = armService(svc, "openResource", (current) => makeSidebarWrapper(svc, current), () => {
+          if (desc) { try { Object.defineProperty(svc, "openResource", desc); return; } catch {} }
+          svc.openResource = prev;
+        });
+        sidebarArmed = { svc, dispose };
+      };
+      ensureSidebarArmed();
+      chatOpenDisposers.push(() => {
+        if (sidebarArmed) { try { sidebarArmed.dispose(); } catch {} sidebarArmed = null; }
+      });
 
       ctx.on("dispose", () => { for (const d of chatOpenDisposers) { try { d(); } catch {} } });
     }

@@ -8,6 +8,11 @@
 //                (root Configuration.xml + type dirs; object defs <Type>/<N>.xml;
 //                child structure recovered from the filesystem).
 //
+// A dump may also carry an ExternalFiles folder at its root: <Name>.xml is the
+// object definition (ExternalDataProcessor | ExternalReport) and <Name>/ holds
+// Forms, Templates and Ext/ObjectModule.bsl. Such objects are not configuration
+// metadata, so the tree shows them as its own root item «Внешние отчеты/обработки».
+//
 // The model is lazy: top level lists groups, groups list objects, objects list
 // sections, sections list items. Only what the user expands gets parsed, so a
 // Large-scale config stays instant. Parsed artifacts (Configuration.mdo,
@@ -72,11 +77,18 @@ const MAIN_GROUPS = [
   ["ExternalDataSources", "Внешние источники данных", "externalDataSource"],
 ];
 
+// Внешние отчеты/обработки: папка ExternalFiles в корне выгрузки. Объект — это
+// <Имя>.xml (описание) и/или папка <Имя>/ (Forms, Templates, Ext/ObjectModule.bsl);
+// в дереве это отдельный корневой пункт, а не группа метаданных.
+const EXT_DIR = "ExternalFiles";
+const EXT_LABEL = "Внешние отчеты/обработки";
+const EXT_ICON = "folder";
+
 const DIRS = new Set([...COMMON_GROUPS, ...MAIN_GROUPS].map(([d]) => d));
 
 const GROUP_LABEL = new Map([...COMMON_GROUPS, ...MAIN_GROUPS].map(([dir, label]) => [dir, label]));
 function groupLabel(dir) {
-  return GROUP_LABEL.get(dir) || dir;
+  return dir === EXT_DIR ? EXT_LABEL : GROUP_LABEL.get(dir) || dir;
 }
 
 // EDT Configuration.mdo property names per type dir (try both spellings —
@@ -298,6 +310,7 @@ export class MetaModel {
     this.flat = null; // flattened ConfigDumpInfo entries (xml)
     this.objCache = new Map(); // object def (edt .mdo / object .xml) by key
     this.groupsCache = null; // [ {key,label,icon,count,hasCommon} ]
+    this.extKinds = null; // Map<имя внешнего объекта, "report" | "dataProcessor">
     this.changedSet = null; // Set<relPath> — активен только при changed=1
     this.changedCountsCache = new Map(); // dir -> отфильтрованный список объектов
   }
@@ -345,6 +358,8 @@ export class MetaModel {
     const items = [];
     if (rootModules.length) items.push(...rootModules);
     if (common.length) items.push({ key: "Общие", label: "Общие", icon: "common", count: common.length, children: common });
+    const extItems = await this.externalObjects();
+    if (extItems.length) items.push({ key: EXT_DIR, label: EXT_LABEL, icon: EXT_ICON, count: extItems.length });
     items.push(...main);
     this.groupsCache = items;
   }
@@ -373,6 +388,7 @@ export class MetaModel {
   // --- object listing ------------------------------------------------------
 
   async listObjects(dir) {
+    if (dir === EXT_DIR) return this.externalObjects();
     let out;
     if (this.format === "edt") {
       const names = this.mdoObjects(dir);
@@ -427,6 +443,69 @@ export class MetaModel {
       }
     }
     return out;
+  }
+
+  // --- внешние отчеты/обработки (ExternalFiles) ----------------------------
+
+  // Объекты раздела = объединение папок <Имя>/ и описаний <Имя>.xml: в выгрузке
+  // встречаются оба варианта (описание без папки и папка без описания).
+  async externalObjects() {
+    const abs = join(this.configRoot, EXT_DIR);
+    let names;
+    try {
+      names = await fs.readdir(abs, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    await this.ensureExtKinds();
+    const byName = new Map(); // имя → есть ли <Имя>.xml
+    for (const d of names) {
+      if (d.isDirectory()) byName.set(d.name, byName.get(d.name) ?? false);
+      else if (d.isFile() && d.name.toLowerCase().endsWith(".xml")) byName.set(d.name.slice(0, -4), true);
+    }
+    const out = [];
+    for (const [name, hasXml] of byName) {
+      out.push({
+        key: EXT_DIR + "/" + name,
+        label: name,
+        icon: this.extIcon(name),
+        count: 1,
+        // Правый клик по объекту — «Открыть XML»; левый раскрывает его (file у
+        // узла внешнего объекта не задан намеренно, иначе клик открывал бы файл).
+        ...(hasXml ? { xmlFile: join(abs, name + ".xml") } : {}),
+      });
+    }
+    out.sort((a, b) => a.label.localeCompare(b.label, "ru"));
+    return out;
+  }
+
+  // Отчет или обработка — по корневому элементу описания. Читается один раз при
+  // построении дерева: иконка нужна и в списке объектов, и в «Изменённых».
+  async ensureExtKinds() {
+    if (this.extKinds) return this.extKinds;
+    const kinds = new Map();
+    const abs = join(this.configRoot, EXT_DIR);
+    try {
+      const names = await fs.readdir(abs);
+      await Promise.all(
+        names
+          .filter((n) => n.toLowerCase().endsWith(".xml"))
+          .map(async (n) => {
+            try {
+              const xml = await fs.readFile(join(abs, n), "utf-8");
+              const m = /<MetaDataObject[^>]*>\s*<([A-Za-z0-9_:]+)/.exec(xml);
+              const cls = m ? m[1].split(":").pop() : "";
+              kinds.set(n.slice(0, -4), cls === "ExternalReport" ? "report" : "dataProcessor");
+            } catch {}
+          }),
+      );
+    } catch {}
+    this.extKinds = kinds;
+    return kinds;
+  }
+
+  extIcon(name) {
+    return this.extKinds?.get(name) ?? "dataProcessor";
   }
 
   // --- object sections -----------------------------------------------------
@@ -519,7 +598,17 @@ export class MetaModel {
     if (this.objCache.has(cacheKey)) return this.objCache.get(cacheKey);
     let def = { name: objName };
     try {
-      if (this.format === "edt") {
+      if (dir === EXT_DIR) {
+        // Внешний объект: описание <Имя>.xml + папка с формами/макетами/модулем.
+        const p = join(this.configRoot, EXT_DIR, objName + ".xml");
+        if (existsSync(p)) {
+          const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+          const md = root.MetaDataObject;
+          const el = md ? md[Object.keys(md).find((k) => k !== "?xml")] : null;
+          if (el) def = this.fromExternalElement(el);
+        }
+        def = await this.mergeFolderChildren(dir, objName, def, true);
+      } else if (this.format === "edt") {
         const p = join(this.configRoot, dir, objName, objName + ".mdo");
         if (existsSync(p)) {
           const root = makeParser().parse(await fs.readFile(p, "utf-8"));
@@ -660,27 +749,54 @@ export class MetaModel {
     return def;
   }
 
+  // Описание внешнего отчета/обработки (MetaDataObject): свойства и <ChildObjects>
+  // с именами реквизитов, табличных частей, форм, команд и макетов.
+  fromExternalElement(el) {
+    const def = { name: el.Properties?.Name ?? "" };
+    const co = el.ChildObjects && typeof el.ChildObjects === "object" ? el.ChildObjects : {};
+    const names = (tag) =>
+      asArray(co[tag])
+        .map((x) => ({ name: x && typeof x === "object" ? String(x.Name ?? "") : String(x ?? "") }))
+        .filter((x) => x.name);
+    for (const [field, tag] of [
+      ["attributes", "Attribute"],
+      ["tabularSections", "TabularSection"],
+      ["forms", "Form"],
+      ["commands", "Command"],
+      ["templates", "Template"],
+    ]) {
+      const items = names(tag);
+      if (items.length) def[field] = items;
+    }
+    return def;
+  }
+
   // Folders on disk fill in forms/commands/templates even when the def xml
-  // carries only Properties (the object-by-object dump variant).
-  async mergeFolderChildren(dir, objName, def) {
+  // carries only Properties (the object-by-object dump variant). union=true —
+  // добавить к списку описания то, что есть только на диске (внешние объекты:
+  // папка полнее <ChildObjects>).
+  async mergeFolderChildren(dir, objName, def, union = false) {
     const base = join(this.configRoot, dir, objName);
-    const add = async (field, sub, itemTag, labelFile) => {
-      if (def[field]) return;
+    const add = async (field, sub) => {
+      if (def[field] && !union) return;
+      let names;
       try {
-        const names = await fs.readdir(join(base, sub));
-        def[field] = names
-          .filter((n) => n.endsWith(".xml"))
-          .map((n) => ({ name: n.slice(0, -4) }));
-        if (labelFile && def[field].length) {
-          // Form folders carry the module under <Name>/Ext/Form/Module.bsl
-        }
+        names = await fs.readdir(join(base, sub));
       } catch {
-        def[field] = [];
+        if (!def[field]) def[field] = [];
+        return;
       }
+      const fromDisk = names.filter((n) => n.endsWith(".xml")).map((n) => ({ name: n.slice(0, -4) }));
+      if (!def[field]) {
+        def[field] = fromDisk;
+        return;
+      }
+      const have = new Set(def[field].map((x) => x.name));
+      for (const it of fromDisk) if (!have.has(it.name)) def[field].push(it);
     };
-    await add("forms", "Forms", "Form");
-    await add("commands", "Commands", "Command");
-    await add("templates", "Templates", "Template");
+    await add("forms", "Forms");
+    await add("commands", "Commands");
+    await add("templates", "Templates");
     return def;
   }
 
@@ -744,6 +860,7 @@ export class MetaModel {
   }
 
   groupIcon(dir) {
+    if (dir === EXT_DIR) return EXT_ICON;
     return [...COMMON_GROUPS, ...MAIN_GROUPS].find(([d]) => d === dir)?.[2] ?? "common";
   }
 
@@ -921,7 +1038,7 @@ export class MetaModel {
     return [...names].sort((a, b) => a.localeCompare(b, "ru")).map((name) => ({
       key: dir + "/" + name,
       label: name,
-      icon: this.groupIcon(dir),
+      icon: dir === EXT_DIR ? this.extIcon(name) : this.groupIcon(dir),
       count: 1,
     }));
   }
@@ -1098,5 +1215,5 @@ export const META_ICON_NAMES = new Set([
   ...COMMON_GROUPS.map(([, , i]) => i),
   ...MAIN_GROUPS.map(([, , i]) => i),
   ...Object.values(SECTION_META).flatMap((m) => [m.icon, m.itemIcon]),
-  "operation", "parameter", "urlTemplate", "commonModule",
+  "operation", "parameter", "urlTemplate", "commonModule", EXT_ICON,
 ]);
