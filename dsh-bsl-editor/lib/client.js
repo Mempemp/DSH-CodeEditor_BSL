@@ -2750,11 +2750,21 @@ window.__ModuleLoader__.load({
       const sessionsList = ctx.sessions?.list;
       if (sessionsList && typeof sessionsList.subscribe === "function" && typeof fetch === "function") {
         let lastCwd = "";
+        // Активная сессия — та, что показана в главной области. Отдельного поля
+        // `current` у списка сессий нет: ядро везде (layout, cordis, список
+        // сессий, «открыть в приложении», agent-preset) выводит её одинаково —
+        // строка с retainedBy.mainView > 0. Прежнее чтение `snap.current` не
+        // срабатывало никогда и молча: корень редактора оставался на первом
+        // воркспейсе реестра, поэтому в дереве была чужая папка, а её разбор
+        // отвечал 400 «конфигурация 1С не найдена».
+        const activeSession = () => {
+          const snap = sessionsList.getSnapshot();
+          const byId = snap?.byId ?? {};
+          return Object.values(byId).find((row) => (row?.retainedBy?.mainView ?? 0) > 0);
+        };
         const syncWorkspace = () => {
           try {
-            const snap = sessionsList.getSnapshot();
-            const currentId = snap?.current;
-            const cwd = currentId ? snap?.byId?.[currentId]?.cwd : undefined;
+            const cwd = activeSession()?.cwd;
             if (!cwd || cwd === lastCwd) return;
             lastCwd = cwd;
             wsRootCache = "";
