@@ -473,6 +473,33 @@ async function handleGitStatus(root, res) {
   json(res, 200, { ok: true, files });
 }
 
+// Разбор unified diff на куски: заголовок файла («diff --git …» + «---»/«+++»)
+// и массив кусков, каждый — строки начиная с «@@». Нужен, чтобы откатывать
+// ровно один кусок и чтобы клиент мог сослаться на кусок по номеру.
+function splitDiffHunks(diff) {
+  const lines = String(diff || "").split("\n");
+  const hi = lines.findIndex((l) => l.startsWith("@@"));
+  if (hi < 0) return { header: "", hunks: [] };
+  const header = lines.slice(0, hi).join("\n") + "\n";
+  const hunks = [];
+  let cur = null;
+  for (let i = hi; i < lines.length; i++) {
+    if (lines[i].startsWith("@@")) {
+      if (cur) hunks.push(cur);
+      cur = [];
+    }
+    if (cur) cur.push(lines[i]);
+  }
+  if (cur) hunks.push(cur);
+  return { header, hunks };
+}
+
+// Тот же runGit, но с stderr: причина отказа git apply иначе не видна.
+function runGitErr(root, args) {
+  const r = spawnSync("git", args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
+  return { ok: !r.error && r.status === 0, out: r.stdout ?? "", err: String(r.stderr ?? "").trim() };
+}
+
 async function handleGitDiff(root, url, res) {
   const path = url.searchParams.get("path") || "";
   const abs = await resolveInside(root, path).catch(() => "");
@@ -480,7 +507,115 @@ async function handleGitDiff(root, url, res) {
   const rel = relative(root, abs);
   const work = runGit(root, ["diff", "--", rel]);
   const cached = runGit(root, ["diff", "--cached", "--", rel]);
-  json(res, 200, { ok: true, path: rel, diff: (cached.ok ? cached.output : "") + (work.ok ? work.output : "") });
+  // Кусок из индекса откатывается иначе, чем кусок рабочей копии
+  // (см. handleRevertHunk), поэтому два diff'а отдаются раздельно — по «diff»
+  // клиент их не различил бы.
+  const cachedDiff = cached.ok ? cached.output : "";
+  const workDiff = work.ok ? work.output : "";
+  json(res, 200, { ok: true, path: rel, diff: cachedDiff + workDiff, cachedDiff, workDiff });
+}
+
+// Откат ОДНОГО куска диффа к состоянию HEAD.
+//   source = "index"    — кусок лежит в индексе (git add): откатываем индекс И
+//                         файл одной операцией (git apply -R --index);
+//   source = "worktree" — только рабочая копия.
+// Клиент присылает НОМЕР куска и его строку «@@»: diff берётся заново, и если
+// по этому номеру лежит уже другой кусок — отказ (файл изменился, пока
+// рисовался вид; откатывать вслепую нельзя).
+async function handleRevertHunk(root, req, res) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const abs = await resolveInside(root, String(body.path || ""));
+    const rel = relative(root, abs);
+    const source = body.source === "index" ? "index" : "worktree";
+    const index = Number(body.index);
+    const diff = runGit(root, source === "index" ? ["diff", "--cached", "--", rel] : ["diff", "--", rel]);
+    if (!diff.ok) return json(res, 400, { ok: false, error: "git diff не отработал" });
+    const { header, hunks } = splitDiffHunks(diff.output);
+    if (!Number.isInteger(index) || index < 0 || index >= hunks.length) {
+      return json(res, 409, { ok: false, error: "файл изменился — обновите вид" });
+    }
+    const hunk = hunks[index].join("\n") + "\n";
+    const expect = String(body.expect || "");
+    if (expect && !hunk.startsWith(expect)) {
+      return json(res, 409, { ok: false, error: "файл изменился — обновите вид" });
+    }
+    mkdirSync(LOG_DIR, { recursive: true });
+    const patchFile = join(LOG_DIR, "revert-hunk.patch");
+    writeFileSync(patchFile, header + hunk, "utf-8");
+    const args = ["apply", "-R", "--whitespace=nowarn"];
+    if (source === "index") args.push("--index");
+    args.push(patchFile);
+    const applied = runGitErr(root, args);
+    if (!applied.ok) return json(res, 400, { ok: false, error: applied.err || "git apply -R не прошёл" });
+    gitStatusCache.delete(root);
+    json(res, 200, { ok: true, index, source });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
+}
+
+// Откат файла целиком к HEAD — индекс и рабочая копия одним движением
+// (как «Undo File» в Cursor: правок в файле не остаётся). Новый (untracked)
+// файл сюда не попадает: версии в HEAD у него нет и кусков диффа тоже нет.
+async function handleRevertFile(root, req, res) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const abs = await resolveInside(root, String(body.path || ""));
+    const rel = relative(root, abs).replace(/\\/g, "/");
+    const r = runGitErr(root, ["checkout", "HEAD", "--", rel]);
+    if (!r.ok) return json(res, 400, { ok: false, error: r.err || "git checkout не прошёл" });
+    gitStatusCache.delete(root);
+    json(res, 200, { ok: true, path: rel });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
+}
+
+// Отметки «просмотрено» для кусков диффа. Живут на машине, не в проекте:
+// %LOCALAPPDATA%/dsh-bsl-editor/reviewed.json → { root: { <rel>: { headSha, hashes } } }.
+// Ключ включает HEAD: после коммита отметки прошлой ревизии не значат ничего.
+const REVIEWED_FILE = join(LOG_DIR, "reviewed.json");
+function loadReviewed() {
+  try {
+    const o = JSON.parse(readFileSync(REVIEWED_FILE, "utf-8"));
+    return o && typeof o === "object" ? o : {};
+  } catch { return {}; }
+}
+async function handleReviewed(root, req, url, res) {
+  const head = runGit(root, ["rev-parse", "HEAD"]);
+  const headSha = head.ok ? head.output.trim() : "";
+  if (req.method === "POST") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const abs = await resolveInside(root, String(body.path || ""));
+      const rel = relative(root, abs).replace(/\\/g, "/");
+      const hashes = Array.isArray(body.hashes)
+        ? body.hashes.filter((h) => typeof h === "string" && h.length < 64).slice(0, 5000)
+        : [];
+      const store = loadReviewed();
+      const forRoot = store[root] && typeof store[root] === "object" ? store[root] : {};
+      if (hashes.length) forRoot[rel] = { headSha, hashes };
+      else delete forRoot[rel];
+      if (Object.keys(forRoot).length) store[root] = forRoot;
+      else delete store[root];
+      mkdirSync(LOG_DIR, { recursive: true });
+      writeFileSync(REVIEWED_FILE, JSON.stringify(store, null, 2) + "\n", "utf-8");
+      return json(res, 200, { ok: true, headSha, hashes });
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e?.message || String(e) });
+    }
+  }
+  const path = url.searchParams.get("path") || "";
+  try {
+    const abs = await resolveInside(root, path);
+    const rel = relative(root, abs).replace(/\\/g, "/");
+    const entry = loadReviewed()[root]?.[rel];
+    const hashes = entry && entry.headSha === headSha && Array.isArray(entry.hashes) ? entry.hashes : [];
+    json(res, 200, { ok: true, headSha, hashes });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
 }
 
 // --- 1C metadata tree (see metadata.js) ------------------------------------
@@ -833,6 +968,18 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-diff",
     handler: (req, res) => handleGitDiff(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/revert-hunk",
+    handler: (req, res) => handleRevertHunk(root, req, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/revert-file",
+    handler: (req, res) => handleRevertFile(root, req, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/reviewed",
+    handler: (req, res) => handleReviewed(root, req, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/meta/status",

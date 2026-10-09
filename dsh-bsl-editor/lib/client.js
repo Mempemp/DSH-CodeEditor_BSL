@@ -596,36 +596,70 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // Полный разбор unified diff: номера добавленных строк новой версии +
-    // блоки удалённых строк; afterLine — строка новой версии, ПЕРЕД которой
-    // стоит блок (= счётчик новых строк после последнего "+"/" " в hunk'е).
-    function parseUnifiedDiff(diff) {
-      const addedLines = new Set();
-      const deletedBlocks = [];
+    // Короткий хеш содержимого куска (FNV-1a): по нему кусок опознаётся между
+    // перерисовками — номера строк при правках выше по файлу «плывут», а текст
+    // куска остаётся тем же.
+    function hashChunk(s) {
+      let h = 2166136261;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return (h >>> 0).toString(36);
+    }
+
+    // Разбор unified diff на куски. Каждый кусок знает: свой номер внутри
+    // источника (для отката), строку «@@» (сверка перед откатом), строки новой
+    // версии с добавленным текстом, блоки удалённых строк и хеш содержимого
+    // (отметка «просмотрено»). source: "index" — кусок из индекса (git add),
+    // "worktree" — из рабочей копии; откатываются они по-разному.
+    function parseDiffHunks(diff, source) {
       const lines = String(diff || "").split("\n");
-      let i = 0;
-      while (i < lines.length) {
-        const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]);
-        i++;
-        if (!m) continue;
-        let newLine = parseInt(m[3], 10);
-        while (i < lines.length && !lines[i].startsWith("@@")) {
-          const l = lines[i];
-          if (l.startsWith("+")) { addedLines.add(newLine); newLine++; i++; continue; }
-          if (l.startsWith("-")) {
-            const texts = [];
-            while (i < lines.length && lines[i].startsWith("-")) {
-              texts.push(lines[i].slice(1));
-              i++;
-            }
-            deletedBlocks.push({ afterLine: newLine, lines: texts });
-            continue;
-          }
-          if (l.startsWith(" ")) newLine++;
-          i++;
+      const hunks = [];
+      let cur = null;
+      let index = -1;
+      for (const l of lines) {
+        if (l.startsWith("@@")) {
+          const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(l);
+          if (!m) continue;
+          index += 1;
+          const newStart = parseInt(m[3], 10);
+          cur = {
+            source,
+            index,
+            header: l,
+            newStart,
+            newLine: newStart,
+            added: [],        // текст добавленных строк
+            addedLines: [],   // их номера в новой версии
+            delRuns: [],      // [{ afterLine, lines[] }] — блоки удалённых строк
+          };
+          hunks.push(cur);
+          continue;
+        }
+        if (!cur) continue;
+        if (l.startsWith("+")) {
+          cur.addedLines.push(cur.newLine);
+          cur.added.push(l.slice(1));
+          cur.newLine += 1;
+          cur.prevKind = "+";
+        } else if (l.startsWith("-")) {
+          // Подряд идущие удалённые строки — ОДИН блок: он рисуется одной
+          // зоной, а разрыв блока даёт отдельную зону на своём месте.
+          if (cur.prevKind !== "-") cur.delRuns.push({ afterLine: cur.newLine, lines: [] });
+          cur.delRuns[cur.delRuns.length - 1].lines.push(l.slice(1));
+          cur.prevKind = "-";
+        } else if (l.startsWith(" ")) {
+          cur.newLine += 1;
+          cur.prevKind = " ";
         }
       }
-      return { addedLines, deletedBlocks };
+      for (const h of hunks) {
+        // Кнопки ставим над куском: первая строка изменения в новой версии.
+        h.anchorLine = Math.max(1, h.newStart);
+        h.id = hashChunk(h.source + "\u0000" + h.delRuns.map((r) => r.lines.join("\n")).join("\u0001") + "\u0000" + h.added.join("\n"));
+      }
+      return hunks;
     }
 
     function EditorView(props) {
@@ -682,7 +716,6 @@ window.__ModuleLoader__.load({
       const lspRef = useRef(null);
       const autoRetriesRef = useRef(0); // bounded auto-reconnect counter for LSP
       const containerRef = useRef(null);
-      const decorationIdsRef = useRef([]);
       const addedDecoIdsRef = useRef([]);
       const diffZoneIdsRef = useRef([]);
       const rootRef = useRef(null);
@@ -696,6 +729,21 @@ window.__ModuleLoader__.load({
       const diffNavRef = useRef({ anchors: [], index: -1 }); // якоря изменений + текущий индекс (вне useState — без ререндеров)
       const diffWidgetRef = useRef(null); // overlay-виджет навигации { dom, label }
       const navigateDiffRef = useRef(null);
+      // Куски диффа открытого файла — сырьё для вида: «принять»/«отклонить»
+      // перерисовывают вид отсюда, без нового запроса к git.
+      const diffHunksRef = useRef([]);
+      // Отметки «просмотрено»: headSha + хеши принятых кусков + показывать ли
+      // их (по умолчанию скрыты — в файле видно только непросмотренное).
+      const reviewedRef = useRef({ headSha: "", hashes: new Set(), show: false });
+      const hunkWidgetsRef = useRef([]); // overlay-виджеты «Отклонить/Принять» по кускам
+      const placeHunkWidgetsRef = useRef(null); // расстановка этих кнопок по строкам
+      const acceptHunkRef = useRef(null);
+      const rejectHunkRef = useRef(null);
+      const resetDiffViewRef = useRef(null); // снять вид диффа (и шапку) — зовётся при закрытии файла
+      const rejectAllTimerRef = useRef(null); // сброс «подтверждения» для «Отклонить все»
+      const rejectAllArmedRef = useRef(false); // первый клик по «Отклонить все» уже сделан
+      const [diffState, setDiffState] = useState({ total: 0, unresolved: 0, reviewed: 0, show: false });
+      const [rejectAllArmed, setRejectAllArmed] = useState(false);
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
       useEffect(() => { openPathRef.current = openPath; }, [openPath]);
       const dirtyRef = useRef(false);
@@ -754,7 +802,27 @@ window.__ModuleLoader__.load({
             + ".bsl-git-added-line{background:rgba(46,160,67,.15);box-shadow:inset 2px 0 0 rgba(46,160,67,.4)}"
             + ".bsl-git-del-zone{background:rgba(248,81,73,.12);overflow:hidden}"
             + ".bsl-git-del-line{color:#f88f8a;font-family:var(--monaco-monospace-font,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:14px;line-height:20px;white-space:pre;text-overflow:clip;overflow:hidden}"
-            + ".bsl-git-flash{animation:bsl-git-flash-kf .6s ease-out}@keyframes bsl-git-flash-kf{from{background:rgba(255,220,90,.35)}to{background:transparent}}";
+            // Принятый (просмотренный) кусок — приглушённый серый: подсветка не
+            // мозолит глаза, но правку ещё видно.
+            + ".bsl-git-reviewed-line{background:rgba(138,148,166,.13);box-shadow:inset 2px 0 0 rgba(138,148,166,.35)}"
+            + ".bsl-git-reviewed-zone{background:rgba(138,148,166,.10)}"
+            + ".bsl-git-reviewed-zone .bsl-git-del-line{color:#9aa3b2}"
+            // Кнопки у куска — overlay-виджеты: по горизонтали прижимаются
+            // вправо (за вычетом миникарты, её ширину плагин кладёт в
+            // --bsl-hunk-right), по вертикали их ставит placeHunkWidgets.
+            + ".bsl-hunk-actions{position:absolute;left:auto!important;right:var(--bsl-hunk-right,26px)!important;display:inline-flex;align-items:center;gap:6px;padding-bottom:3px;pointer-events:auto}"
+            + ".bsl-hunk-btn{font-family:var(--dsw-font-family,inherit);font-size:12px;font-weight:500;line-height:18px;height:20px;padding:0 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-2,#22242a);color:var(--dsw-alias-label-secondary,#8a94a6);cursor:pointer;white-space:nowrap;box-shadow:0 1px 4px rgba(0,0,0,.25)}"
+            + ".bsl-hunk-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}"
+            + ".bsl-hunk-btn--reject:hover{background:rgba(248,81,73,.18);border-color:rgba(248,81,73,.55);color:#f88f8a}"
+            + ".bsl-hunk-btn--accept:hover{background:rgba(46,160,67,.18);border-color:rgba(46,160,67,.55);color:#7ee2a8}"
+            + ".bsl-hunk-btn--armed{background:rgba(248,81,73,.22)!important;border-color:rgba(248,81,73,.6)!important;color:#f88f8a!important}"
+            + ".bsl-git-flash{animation:bsl-git-flash-kf .6s ease-out}@keyframes bsl-git-flash-kf{from{background:rgba(255,220,90,.35)}to{background:transparent}}"
+            // Плашка MCP-менеджера (чужой плагин, классы dm-*) висит в том же
+            // правом верхнем углу, где стоят кнопки файла, и закрывает их.
+            // Сдвигаем плашку ниже полосы вкладок: своей настройкой плагин
+            // положение не сохраняет. Панель двигаем вместе с плашкой, иначе
+            // они разъезжаются.
+            + ".dm-float,.dm-float-panel{top:84px!important}";
           document.head.appendChild(st);
         }
         let alive = true;
@@ -987,13 +1055,16 @@ window.__ModuleLoader__.load({
           const syncNavSub = editor.onDidScrollChange(() => {
             if (syncingNav) return;
             syncingNav = true;
-            try { syncDiffNavRef.current?.(); } finally { syncingNav = false; }
+            try { syncDiffNavRef.current?.(); placeHunkWidgetsRef.current?.(); } finally { syncingNav = false; }
           });
+          // Кнопки кусков держатся за строку сами (overlay-виджет строки не
+          // знает), поэтому их надо переставлять и при смене размеров редактора.
+          const layoutSub = editor.onDidLayoutChange(() => { placeHunkWidgetsRef.current?.(); });
           const cursorSub = editor.onDidChangeCursorPosition((e) => {
             editorPersist.cursor = { lineNumber: e.position.lineNumber, column: e.position.column };
           });
 
-          return () => { alive = false; scrollSub.dispose(); syncNavSub.dispose(); cursorSub.dispose(); editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
+          return () => { alive = false; scrollSub.dispose(); syncNavSub.dispose(); layoutSub.dispose(); cursorSub.dispose(); editor.dispose(); editorHost.removeEventListener("mouseenter", onEditorEnter); editorHost.removeEventListener("mouseleave", onEditorLeave); window.removeEventListener("keydown", onGlobalKey, true); };
         }).catch((e) => {
           console.error("[dsh-bsl-editor] monaco", e);
           if (alive) setMonacoError(String(e?.message || e));
@@ -1289,20 +1360,390 @@ window.__ModuleLoader__.load({
             openPathRef.current = null;
             if (editorRef.current) editorRef.current.setModel(null);
             modelRef.current = null;
+            resetDiffViewRef.current?.();
             setEditorNotice("Выберите файл из дерева");
             setHighlightPath(null);
           }
         }
       }, [tabs, openFile]);
 
+      // Снять вид диффа с текущей модели: зоны удалённых строк, подсветка
+      // добавленных, кнопки кусков и состояние в шапке. Всё, что мы вешаем на
+      // РЕДАКТОР (а не на модель), живёт до этой чистки — при смене файла его
+      // надо звать, иначе чужие зоны остаются на новом файле.
+      const clearDiffView = useCallback(() => {
+        const ed = editorRef.current;
+        diffNavRef.current.anchors = [];
+        diffNavRef.current.index = -1;
+        if (diffWidgetRef.current) diffWidgetRef.current.dom.style.display = "none";
+        if (!ed) return;
+        try {
+          ed.changeViewZones((acc) => { for (const id of diffZoneIdsRef.current) acc.removeZone(id); });
+        } catch {}
+        diffZoneIdsRef.current = [];
+        try {
+          ed.deltaDecorations(addedDecoIdsRef.current, []);
+        } catch {}
+        addedDecoIdsRef.current = [];
+        for (const w of hunkWidgetsRef.current) {
+          try { ed.removeOverlayWidget(w); } catch {}
+        }
+        hunkWidgetsRef.current = [];
+      }, []);
+
+      // Снять вид диффа целиком, включая состояние в шапке (закрыли последний
+      // файл — кнопок и счётчиков быть не должно).
+      const resetDiffView = useCallback(() => {
+        clearDiffView();
+        diffHunksRef.current = [];
+        reviewedRef.current = { headSha: "", hashes: new Set(), show: reviewedRef.current.show };
+        setDiffState({ total: 0, unresolved: 0, reviewed: 0, show: reviewedRef.current.show });
+      }, [clearDiffView]);
+      resetDiffViewRef.current = resetDiffView;
+
+      // Отрисовка вида диффа по готовым кускам: подсветка добавленных строк,
+      // «призраки» удалённых, кнопки «Отклонить/Принять» у каждого куска,
+      // навигатор и счётчики. Принятые куски по умолчанию не рисуются вовсе —
+      // в файле остаётся только то, что ещё не посмотрели.
+      const renderDiffView = useCallback((path, hunks, lineCount, isNewUntracked) => {
+        const ed = editorRef.current;
+        const monaco = monacoRef.current;
+        const model = ed && ed.getModel();
+        if (!ed || !monaco || !model) return;
+        const rev = reviewedRef.current;
+        const isReviewed = (h) => rev.hashes.has(h.id);
+        const shown = hunks.filter((h) => rev.show || !isReviewed(h));
+
+        // 1. Подсветка добавленных строк (и «файл целиком», если он ещё не в git).
+        const addedDecorations = [];
+        if (isNewUntracked) {
+          for (let ln = 1; ln <= lineCount; ln++) {
+            addedDecorations.push({
+              range: new monaco.Range(ln, 1, ln, 1),
+              options: { isWholeLine: true, className: "bsl-git-added-line", linesDecorationsClassName: "bsl-git-added" },
+            });
+          }
+        } else {
+          for (const h of shown) {
+            const reviewed = isReviewed(h);
+            for (const ln of h.addedLines) {
+              addedDecorations.push({
+                range: new monaco.Range(ln, 1, ln, 1),
+                options: {
+                  isWholeLine: true,
+                  className: reviewed ? "bsl-git-reviewed-line" : "bsl-git-added-line",
+                  linesDecorationsClassName: reviewed ? "bsl-git-reviewed" : "bsl-git-added",
+                },
+              });
+            }
+          }
+        }
+        addedDecoIdsRef.current = ed.deltaDecorations(addedDecoIdsRef.current, addedDecorations);
+
+        // 2. Зоны удалённых строк. В Monaco 0.52 у accessor нет removeAll —
+        // треким id зон сами.
+        const zoneIds = [];
+        ed.changeViewZones(function (acc) {
+          for (const id of diffZoneIdsRef.current) acc.removeZone(id);
+          for (const h of shown) {
+            const reviewed = isReviewed(h);
+            for (const run of h.delRuns) {
+              if (!run.lines.length) continue;
+              const node = document.createElement("div");
+              node.className = reviewed ? "bsl-git-del-zone bsl-git-reviewed-zone" : "bsl-git-del-zone";
+              // Табы в тексте удалённых строк должны рендериться той же
+              // ширины, что и в редакторе (браузерный дефолт — 8).
+              const ts = model.getOptions?.().tabSize;
+              if (ts) { node.style.tabSize = String(ts); node.style.MozTabSize = String(ts); }
+              for (const text of run.lines) {
+                const ln = document.createElement("div");
+                ln.className = "bsl-git-del-line";
+                ln.textContent = text;
+                node.appendChild(ln);
+              }
+              zoneIds.push(acc.addZone({
+                // afterLine — строка, ПЕРЕД которой стоит блок ⇒ зона после предыдущей
+                afterLineNumber: Math.max(0, Math.min(run.afterLine - 1, lineCount)),
+                heightInLines: run.lines.length,
+                domNode: node,
+              }));
+            }
+          }
+        });
+        diffZoneIdsRef.current = zoneIds;
+
+        // 3. Навигация: один якорь на кусок — кусок и есть один визуальный блок.
+        const anchors = shown
+          .map((h) => ({ line: Math.max(1, Math.min(h.anchorLine, Math.max(lineCount, 1))), kind: h.addedLines.length ? "added" : "deleted" }))
+          .sort((a, b) => a.line - b.line);
+        diffNavRef.current.anchors = anchors;
+        diffNavRef.current.index = -1;
+
+        // 4. Плавающий навигатор ↑ N/M ↓ (правый верхний угол редактора).
+        let w = diffWidgetRef.current;
+        if (!w) {
+          const dom = document.createElement("div");
+          dom.style.cssText = "position:absolute;right:20px;top:10px;z-index:30;display:none;align-items:center;gap:2px;padding:3px 5px;border-radius:8px;background:var(--dsw-alias-bg-layer-1,#1b1d22);border:1px solid var(--dsw-alias-border-l2,#3a3d45);box-shadow:0 4px 14px rgba(0,0,0,.35)";
+          const btnCss = "border:none;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;width:30px;height:30px;font-size:16px;display:inline-flex;align-items:center;justify-content:center;";
+          const up = document.createElement("button");
+          up.style.cssText = btnCss;
+          up.textContent = "↑";
+          up.title = "Предыдущее изменение (Alt+↑)";
+          up.onclick = () => navigateDiffRef.current?.(-1);
+          const label = document.createElement("span");
+          label.style.cssText = "min-width:56px;text-align:center;color:var(--dsw-alias-label-primary);font-size:13px;font-weight:600;opacity:.95;pointer-events:none;user-select:none";
+          const down = document.createElement("button");
+          down.style.cssText = btnCss;
+          down.textContent = "↓";
+          down.title = "Следующее изменение (Alt+↓)";
+          down.onclick = () => navigateDiffRef.current?.(1);
+          dom.appendChild(up);
+          dom.appendChild(label);
+          dom.appendChild(down);
+          ed.addOverlayWidget({ getId: () => "bsl.gitnav", getDomNode: () => dom, getPosition: () => null });
+          w = { dom, label };
+          diffWidgetRef.current = w;
+        }
+        w.dom.style.display = (anchors.length || isNewUntracked) ? "inline-flex" : "none";
+        w.label.textContent = isNewUntracked ? "новый файл" : (anchors.length ? "1 / " + anchors.length : "");
+
+        // Миникарта занимает правый край, кнопки должны встать левее неё.
+        // Размер миникарты задаёт Monaco, поэтому ширину кладём в CSS-переменную.
+        const hostNode = ed.getDomNode();
+        if (hostNode) {
+          const mini = hostNode.querySelector(".minimap");
+          hostNode.style.setProperty("--bsl-hunk-right", ((mini ? mini.offsetWidth : 0) + 26) + "px");
+        }
+
+        // 5. Кнопки у каждого куска: «Отклонить» / «Принять» (у просмотренного —
+        // «Вернуть»). Ставим их overlay-виджетами, а не content-виджетами: у
+        // content-виджетов система координат — бесконечное полотно строк
+        // (ширина 2^24), поэтому к правому краю редактора их не прижать:
+        // «right» отсчитывался от этого полотна, и кнопки уезжали далеко за
+        // экран. Слой overlay-виджетов шириной с редактор, зато строку они не
+        // знают — вертикаль ставит placeHunkWidgets по строке-якорю.
+        for (const widget of hunkWidgetsRef.current) {
+          try { ed.removeOverlayWidget(widget); } catch {}
+        }
+        hunkWidgetsRef.current = [];
+        const mkBtn = (text, title, cls, onClick) => {
+          const b = document.createElement("button");
+          b.className = "bsl-hunk-btn " + cls;
+          b.type = "button";
+          b.textContent = text;
+          b.title = title;
+          b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); };
+          b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onClick(); };
+          return b;
+        };
+        for (const h of shown) {
+          const dom = document.createElement("div");
+          dom.className = "bsl-hunk-actions";
+          dom.style.display = "none";
+          if (isReviewed(h)) {
+            dom.appendChild(mkBtn("Вернуть", "Считать кусок непросмотренным — вернётся в подсветку", "", () => acceptHunkRef.current?.(h, false)));
+          } else {
+            dom.appendChild(mkBtn("Отклонить", "Вернуть этот кусок к состоянию HEAD — правка уйдёт из файла", "bsl-hunk-btn--reject", () => rejectHunkRef.current?.(h)));
+            dom.appendChild(mkBtn("Принять", "Пометить кусок просмотренным — он уйдёт из подсветки", "bsl-hunk-btn--accept", () => acceptHunkRef.current?.(h, true)));
+          }
+          const line = Math.max(1, Math.min(h.anchorLine, model.getLineCount()));
+          // Низ блока: последняя добавленная строка, а если кусок — только
+          // удаление, то строка-якорь (под ней и стоит красный блок).
+          const endLine = h.addedLines.length ? Math.min(Math.max(...h.addedLines), model.getLineCount()) : line;
+          const widget = {
+            getId: () => "bsl.hunk." + h.source + "." + h.index + "." + h.id,
+            getDomNode: () => dom,
+            getPosition: () => null,
+            line,
+            endLine,
+            h: 0,
+          };
+          try {
+            ed.addOverlayWidget(widget);
+            hunkWidgetsRef.current.push(widget);
+          } catch {}
+        }
+        placeHunkWidgetsRef.current?.();
+
+        // 6. Состояние для шапки (кнопки по файлу целиком).
+        const next = {
+          total: hunks.length,
+          unresolved: hunks.filter((h) => !isReviewed(h)).length,
+          reviewed: hunks.filter(isReviewed).length,
+          show: !!rev.show,
+        };
+        setDiffState((prev) => (prev.total === next.total && prev.unresolved === next.unresolved && prev.reviewed === next.reviewed && prev.show === next.show ? prev : next));
+      }, []);
+
+      // Кнопки куска: overlay-виджет строки не знает, поэтому ставим их сами —
+      // под блоком изменений (так просили), а если блок кончается у нижней
+      // кромки и кнопки не помещаются, то над блоком. Что ушло за пределы
+      // видимой области — прячем.
+      const placeHunkWidgets = useCallback(() => {
+        const ed = editorRef.current;
+        const model = ed && ed.getModel();
+        if (!ed || !model) return;
+        const hostEl = ed.getDomNode && ed.getDomNode();
+        const scrollTop = ed.getScrollTop() || 0;
+        // Высоту видимой области берём у самого редактора: getLayoutInfo()
+        // отдаёт размер, посчитанный при последней раскладке, и у редактора,
+        // созданного в скрытой вкладке, он долго остаётся нулевым — из-за этого
+        // кнопки уезжали под верхнюю кромку.
+        const viewH = (hostEl && hostEl.clientHeight) || (ed.getLayoutInfo() || {}).height || 0;
+        const lineH = (ed.getOption && ed.getOption(monacoRef.current?.editor?.EditorOption?.lineHeight)) || 20;
+        for (const w of hunkWidgetsRef.current) {
+          const dom = w.getDomNode();
+          if (!dom) continue;
+          // Высоту кнопок меряем один раз: замер заставляет браузер
+          // пересчитывать раскладку, а зовут эту функцию на каждый скролл.
+          if (!w.h) {
+            dom.style.display = "inline-flex";
+            w.h = dom.offsetHeight || 25;
+          }
+          const anchor = Math.max(1, Math.min(w.line, model.getLineCount()));
+          const end = Math.max(anchor, Math.min(w.endLine || anchor, model.getLineCount()));
+          const endY = (ed.getTopForLineNumber(end) || 0) - scrollTop;
+          const top = endY + lineH + 2; // строго под блоком изменений
+          const fits = top >= 0 && top + w.h <= viewH - 1;
+          dom.style.top = (top | 0) + "px";
+          dom.style.display = fits ? "inline-flex" : "none";
+        }
+      }, []);
+      placeHunkWidgetsRef.current = placeHunkWidgets;
+
+      // Отметка «просмотрено» по куску (+ запись отметок на диск: они живут
+      // между сессиями и привязаны к текущему HEAD).
+      const acceptHunk = useCallback(async (hunk, accept) => {
+        const path = openPathRef.current;
+        if (!path) return;
+        const rev = reviewedRef.current;
+        if (accept) rev.hashes.add(hunk.id);
+        else rev.hashes.delete(hunk.id);
+        const ed = editorRef.current;
+        renderDiffView(path, diffHunksRef.current, ed?.getModel()?.getLineCount() || 0, false);
+        try {
+          await fetch("/bsl/reviewed", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path, hashes: [...rev.hashes] }),
+          });
+        } catch {}
+      }, [renderDiffView]);
+      acceptHunkRef.current = acceptHunk;
+
+      // Отказ куска: возврат к HEAD делает git (`git apply -R` по куску) —
+      // строки в файле меняет он, а не редактор, поэтому после отката файл
+      // перечитывается с диска.
+      const rejectHunk = useCallback(async (hunk) => {
+        const path = openPathRef.current;
+        if (!path) return;
+        if (openBuffersRef.current.has(path)) {
+          setEditorNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
+          return;
+        }
+        try {
+          const res = await fetch("/bsl/revert-hunk", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path, index: hunk.index, source: hunk.source, expect: hunk.header }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false) setEditorNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
+          else setEditorNotice(null);
+        } catch (e) {
+          setEditorNotice("Отклонить не удалось: " + (e?.message || String(e)));
+        }
+        await revertFileRef.current?.();
+      }, []);
+      rejectHunkRef.current = rejectHunk;
+
+      // Файл целиком: «Принять все» — отметить просмотренными все куски;
+      // «Отклонить все» — вернуть файл к HEAD (git checkout HEAD -- файл).
+      const acceptAllHunks = useCallback(async () => {
+        const path = openPathRef.current;
+        if (!path) return;
+        const rev = reviewedRef.current;
+        for (const h of diffHunksRef.current) rev.hashes.add(h.id);
+        const ed = editorRef.current;
+        renderDiffView(path, diffHunksRef.current, ed?.getModel()?.getLineCount() || 0, false);
+        try {
+          await fetch("/bsl/reviewed", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path, hashes: [...rev.hashes] }),
+          });
+        } catch {}
+      }, [renderDiffView]);
+
+      // Показать/спрятать просмотренные куски: спрятанные по умолчанию, а
+      // показать их нужно, чтобы вернуть ошибочно принятый кусок в работу.
+      const toggleReviewedShow = useCallback(() => {
+        const rev = reviewedRef.current;
+        rev.show = !rev.show;
+        const path = openPathRef.current;
+        if (!path) return;
+        const ed = editorRef.current;
+        renderDiffView(path, diffHunksRef.current, ed?.getModel()?.getLineCount() || 0, false);
+      }, [renderDiffView]);
+
+      const rejectAllHunks = useCallback(async () => {
+        const path = openPathRef.current;
+        if (!path) return;
+        if (openBuffersRef.current.has(path)) {
+          setEditorNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
+          return;
+        }
+        try {
+          const res = await fetch("/bsl/revert-file", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false) setEditorNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
+          else setEditorNotice(null);
+        } catch (e) {
+          setEditorNotice("Отклонить не удалось: " + (e?.message || String(e)));
+        }
+        reviewedRef.current.hashes = new Set();
+        await revertFileRef.current?.();
+      }, []);
+
+      // Первый клик взводит «подтверждение» на 4 секунды, второй — откатывает
+      // файл: откат стирает правки в рабочей копии без возврата.
+      const onRejectAllClick = useCallback(() => {
+        if (rejectAllTimerRef.current) {
+          clearTimeout(rejectAllTimerRef.current);
+          rejectAllTimerRef.current = null;
+        }
+        if (!rejectAllArmedRef.current) {
+          rejectAllArmedRef.current = true;
+          setRejectAllArmed(true);
+          rejectAllTimerRef.current = setTimeout(() => {
+            rejectAllArmedRef.current = false;
+            rejectAllTimerRef.current = null;
+            setRejectAllArmed(false);
+          }, 4000);
+          return;
+        }
+        rejectAllArmedRef.current = false;
+        setRejectAllArmed(false);
+        rejectAllHunks();
+      }, [rejectAllHunks]);
+      useEffect(() => () => { if (rejectAllTimerRef.current) clearTimeout(rejectAllTimerRef.current); }, []);
+
       const refreshGitDecorations = useCallback(async (path) => {
         if (!editorRef.current || !monacoRef.current) return;
         // Вызовы из onDidChangeModelContent приходят без аргумента — берём текущий файл
         if (path == null) path = openPathRef.current;
         if (!path) return;
-        const monaco = monacoRef.current;
         try {
-          const data = await fetchJson("/bsl/git-diff?path=" + encodeURIComponent(path));
+          // Diff и отметки «просмотрено» — параллельно: отметки нужны, чтобы
+          // не рисовать уже посмотренные куски.
+          const [data, revData] = await Promise.all([
+            fetchJson("/bsl/git-diff?path=" + encodeURIComponent(path)),
+            fetchJson("/bsl/reviewed?path=" + encodeURIComponent(path)).catch(() => ({ hashes: [] })),
+          ]);
           const diff = data.diff || "";
           // Гонка: пока летел запрос, пользователь мог переключить файл —
           // декорации и зоны чужого диффа применять нельзя. Проверяем модель
@@ -1312,43 +1753,20 @@ window.__ModuleLoader__.load({
           const lineCount = model ? model.getLineCount() : 0;
           const modelPath = model ? normPath(decodeURIComponent(model.uri.path.replace(/^\//, ""))) : null;
           if (!model || modelPath !== normPath(path)) {
-            // zones/anchors belong to another model — drop stale nav state
-            // и подчистить зоны/декорации, оставшиеся от предыдущей модели.
-            diffNavRef.current.anchors = [];
-            diffNavRef.current.index = -1;
-            if (diffWidgetRef.current) diffWidgetRef.current.dom.style.display = "none";
-            try {
-              ed.changeViewZones((acc) => { for (const id of diffZoneIdsRef.current) acc.removeZone(id); });
-            } catch {}
-            diffZoneIdsRef.current = [];
-            try {
-              ed.deltaDecorations(decorationIdsRef.current, []);
-              ed.deltaDecorations(addedDecoIdsRef.current, []);
-            } catch {}
-            decorationIdsRef.current = [];
-            addedDecoIdsRef.current = [];
+            // Привязки (зоны, декорации, виджеты) — на редакторе, а не на
+            // модели: при смене файла их надо снять руками.
+            resetDiffView();
             return;
           }
-          // map unified diff hunks to changed line decorations
-          const changed = new Set();
-          const re = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/gm;
-          let m;
-          while ((m = re.exec(diff)) !== null) {
-            let newLine = parseInt(m[2], 10);
-            for (const line of diff.slice(m.index).split("\n").slice(1)) {
-              if (line.startsWith("@@")) break;
-              if (line.startsWith("+")) { changed.add(newLine); newLine++; }
-              else if (line.startsWith("-")) { /* deletion, no new-line */ }
-              else if (line.startsWith(" ")) newLine++;
-            }
-          }
-          const decorations = [...changed].map((ln) => ({
-            range: new monaco.Range(ln, 1, ln, 1),
-            options: { isWholeLine: true, linesDecorationsClassName: "bsl-git-changed", className: "bsl-git-changed-line" },
-          }));
-          const old = decorationIdsRef.current;
-          decorationIdsRef.current = editorRef.current.deltaDecorations(old, decorations);
-          const parsed = parseUnifiedDiff(diff);
+          const rev = reviewedRef.current;
+          rev.headSha = revData.headSha || "";
+          rev.hashes = new Set(Array.isArray(revData.hashes) ? revData.hashes : []);
+          // Хост отдаёт индекс и рабочую копию раздельно (откатываются они
+          // по-разному). Старый хост без этих полей — diff целиком как рабочая копия.
+          const cD = data.cachedDiff, wD = data.workDiff;
+          diffHunksRef.current = (cD === undefined && wD === undefined)
+            ? parseDiffHunks(diff, "worktree")
+            : [...parseDiffHunks(cD || "", "index"), ...parseDiffHunks(wD || "", "worktree")];
           // Файл ещё не в git (новый объект): базы для diff нет, значит diff
           // пуст — без этого свежесохранённый файл выглядит «без изменений».
           // Помечаем все строки как добавленные (gutter как в VS Code).
@@ -1359,92 +1777,14 @@ window.__ModuleLoader__.load({
             return s;
           })();
           const isNewUntracked = !diff.trim() && String(gitFilesRef.current.get(relPath) || "").includes("?");
-          if (isNewUntracked) for (let ln = 1; ln <= lineCount; ln++) parsed.addedLines.add(ln);
-          const addedDecorations = [...parsed.addedLines].sort((a, b) => a - b).map((ln) => ({
-            range: new monaco.Range(ln, 1, ln, 1),
-            options: { isWholeLine: true, className: "bsl-git-added-line", linesDecorationsClassName: "bsl-git-added" },
-          }));
-          addedDecoIdsRef.current = editorRef.current.deltaDecorations(addedDecoIdsRef.current, addedDecorations);
-          // В Monaco 0.52 у accessor нет removeAll — треким id зон сами.
-          const zoneIds = [];
-          ed.changeViewZones(function (acc) {
-            for (const id of diffZoneIdsRef.current) acc.removeZone(id);
-            for (const block of parsed.deletedBlocks) {
-              if (!block.lines.length) continue;
-              const node = document.createElement("div");
-              node.className = "bsl-git-del-zone";
-              // Табы в тексте удалённых строк должны рендериться той же
-              // ширины, что и в редакторе (браузерный дефолт — 8).
-              const ts = model ? model.getOptions?.().tabSize : 4;
-              if (ts) { node.style.tabSize = String(ts); node.style.MozTabSize = String(ts); }
-              for (const text of block.lines) {
-                const ln = document.createElement("div");
-                ln.className = "bsl-git-del-line";
-                ln.textContent = text;
-                node.appendChild(ln);
-              }
-              zoneIds.push(acc.addZone({
-                // afterLine — строка, ПЕРЕД которой стоит блок ⇒ зона после предыдущей
-                afterLineNumber: Math.max(0, Math.min(block.afterLine - 1, lineCount)),
-                heightInLines: block.lines.length,
-                domNode: node,
-              }));
-            }
-          });
-          diffZoneIdsRef.current = zoneIds;
-          const anchors = [];
-          // Непрерывные добавленные строки схлопываются в один блок-якорь.
-          const addedSorted = [...parsed.addedLines].sort((a, b) => a - b);
-          for (let i = 0; i < addedSorted.length; i++) {
-            const start = addedSorted[i];
-            while (i + 1 < addedSorted.length && addedSorted[i + 1] === addedSorted[i] + 1) i++;
-            anchors.push({ line: start, kind: "added" });
-          }
-          for (const block of parsed.deletedBlocks) anchors.push({ line: Math.max(1, Math.min(block.afterLine, Math.max(lineCount, 1))), kind: "deleted" });
-          anchors.sort((a, b) => a.line - b.line);
-          // Замена («−строка / +строка») даёт del- и add-якорь на соседних
-          // строках — визуально это один блок, схлопываем в один якорь.
-          const mergedAnchors = [];
-          for (const a of anchors) {
-            const prev = mergedAnchors[mergedAnchors.length - 1];
-            if (prev && a.line - prev.line <= 1) continue;
-            mergedAnchors.push(a);
-          }
-          diffNavRef.current.anchors = mergedAnchors;
-          diffNavRef.current.index = -1;
-          let w = diffWidgetRef.current;
-          if (!w) {
-            const dom = document.createElement("div");
-            dom.style.cssText = "position:absolute;right:20px;top:10px;z-index:30;display:none;align-items:center;gap:2px;padding:3px 5px;border-radius:8px;background:var(--dsw-alias-bg-layer-1,#1b1d22);border:1px solid var(--dsw-alias-border-l2,#3a3d45);box-shadow:0 4px 14px rgba(0,0,0,.35)";
-            const btnCss = "border:none;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;width:30px;height:30px;font-size:16px;display:inline-flex;align-items:center;justify-content:center;";
-            const up = document.createElement("button");
-            up.style.cssText = btnCss;
-            up.textContent = "↑";
-            up.title = "Предыдущее изменение (Alt+↑)";
-            up.onclick = () => navigateDiffRef.current?.(-1);
-            const label = document.createElement("span");
-            label.style.cssText = "min-width:56px;text-align:center;color:var(--dsw-alias-label-primary);font-size:13px;font-weight:600;opacity:.95;pointer-events:none;user-select:none";
-            const down = document.createElement("button");
-            down.style.cssText = btnCss;
-            down.textContent = "↓";
-            down.title = "Следующее изменение (Alt+↓)";
-            down.onclick = () => navigateDiffRef.current?.(1);
-            dom.appendChild(up);
-            dom.appendChild(label);
-            dom.appendChild(down);
-            ed.addOverlayWidget({ getId: () => "bsl.gitnav", getDomNode: () => dom, getPosition: () => null });
-            w = { dom, label };
-            diffWidgetRef.current = w;
-          }
-          w.dom.style.display = (mergedAnchors.length || isNewUntracked) ? "inline-flex" : "none";
-          w.label.textContent = isNewUntracked ? "новый файл" : (mergedAnchors.length ? "1 / " + mergedAnchors.length : "");
+          renderDiffView(path, diffHunksRef.current, lineCount, isNewUntracked);
           // Свежеоткрытый файл с диффами: сразу позиционируем на первый блок.
           // Признак свежести сбрасываем по факту ЛЮБОГО завершённого refresh
           // этого файла: если диффов не было, флаг не должен дожить до первой
           // правки (появится дифф — случится ложный автопереход).
           const isFreshOpen = freshOpenPathRef.current === normPath(path);
           freshOpenPathRef.current = null;
-          if (isFreshOpen && mergedAnchors.length) {
+          if (isFreshOpen && diffNavRef.current.anchors.length) {
             const ed2 = editorRef.current;
             if (ed2 && !ed2.isDisposed?.()) {
               requestAnimationFrame(() => {
@@ -1453,7 +1793,7 @@ window.__ModuleLoader__.load({
             }
           }
         } catch {}
-      }, []);
+      }, [clearDiffView, renderDiffView]);
       refreshGitDecorationsRef.current = refreshGitDecorations;
 
       // Persist the open model back to disk via the host /bsl/write route.
@@ -2545,6 +2885,38 @@ window.__ModuleLoader__.load({
                 ],
               });
             }),
+            // Принять/отклонить изменения по файлу целиком. «Отклонить все»
+            // необратим для рабочей копии, поэтому выполняется вторым кликом.
+            // Группа стоит последней и прижата к правому краю: вкладки идут
+            // слева, поэтому от появления группы и от смены ширины счётчика они
+            // не двигаются. sticky right:0 — как у кнопок файла слева, чтобы
+            // группа оставалась видна при горизонтальной прокрутке вкладок.
+            diffState.total > 0 ? jsxs("span", {
+              style: { position: "sticky", right: 0, zIndex: 2, marginLeft: "auto", paddingLeft: 12, display: "inline-flex", alignItems: "center", gap: 6, flexShrink: 0, background: "var(--dsw-alias-bg-layer-2)" },
+              children: [
+                jsx("button", {
+                  className: "bsl-hunk-btn",
+                  style: { visibility: diffState.reviewed > 0 ? "visible" : "hidden" },
+                  onClick: () => toggleReviewedShow(),
+                  title: diffState.show ? "Спрятать просмотренные куски" : "Показать просмотренные куски",
+                  children: diffState.show ? "Скрыть просмотренные" : "Просмотрено: " + diffState.reviewed,
+                }),
+                jsx("button", {
+                  className: "bsl-hunk-btn bsl-hunk-btn--reject" + (rejectAllArmed ? " bsl-hunk-btn--armed" : ""),
+                  onClick: () => onRejectAllClick(),
+                  title: rejectAllArmed
+                    ? "Нажмите ещё раз: файл вернётся к состоянию HEAD, правки в нём пропадут"
+                    : "Вернуть файл к состоянию HEAD — правки в файле пропадут",
+                  children: rejectAllArmed ? "Подтвердить откат" : "Отклонить все",
+                }),
+                jsx("button", {
+                  className: "bsl-hunk-btn bsl-hunk-btn--accept",
+                  onClick: () => acceptAllHunks(),
+                  title: "Пометить все куски просмотренными — подсветка уйдёт",
+                  children: "Принять все",
+                }),
+              ],
+            }) : null,
           ],
         }),
         jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
