@@ -473,11 +473,15 @@ async function handleGitStatus(root, res) {
   json(res, 200, { ok: true, files });
 }
 
-// Разбор unified diff на куски: заголовок файла («diff --git …» + «---»/«+++»)
-// и массив кусков, каждый — строки начиная с «@@». Нужен, чтобы откатывать
-// ровно один кусок и чтобы клиент мог сослаться на кусок по номеру.
+// Разбор unified diff на изменения: заголовок файла («diff --git …» + «---»/«+++»)
+// и массив изменений, каждый — строки начиная с «@@». Нужен, чтобы откатывать
+// ровно один изменение и чтобы клиент мог сослаться на изменение по номеру.
 function splitDiffHunks(diff) {
   const lines = String(diff || "").split("\n");
+  // Дифф кончается переводом строки: в конце остаётся пустой «хвост». Если его
+  // не отбросить, он прилипает к ПОСЛЕДНЕМУ изменению в файле — и у того же
+  // изменения в другом диффе (там оно не последнее) отпечаток получается другим.
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
   const hi = lines.findIndex((l) => l.startsWith("@@"));
   if (hi < 0) return { header: "", hunks: [] };
   const header = lines.slice(0, hi).join("\n") + "\n";
@@ -500,14 +504,38 @@ function runGitErr(root, args) {
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "", err: String(r.stderr ?? "").trim() };
 }
 
+// Дифф берём БЕЗ строк контекста (-U0). С обычными тремя строками git склеивает
+// разные правки, стоящие через несколько неизменённых строк, в ОДИН изменение — и
+// тогда одна пара кнопок «принять/отклонить» накрывала бы сразу две правки, а
+// отказ по одной откатывал бы и соседнюю. Без контекста каждый изменение — ровно
+// изменённые строки, и граница блока совпадает с границей правки.
+// Такой патч (без строк контекста) git применяет только с --unidiff-zero.
+const DIFF_ARGS = ["-U0"];
+
+// Отпечаток текста изменения — ТОТ ЖЕ, что считает клиент (lib/client.js,
+// hashChunk): по нему хост узнаёт просмотренные изменения в свежем diff'е.
+// Держать их одинаковыми обязательно, и это проверяется тестом
+// tests/_stage.mjs: расхождение видно как «просмотренный изменение не нашёлся».
+// Отпечаток вместо самого текста — чтобы отметки не тащили в файл хранилища
+// копию изменённых строк (большой изменение не влезал в лимит и молча не
+// индексировался).
+function hashChunk(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
 async function handleGitDiff(root, url, res) {
   const path = url.searchParams.get("path") || "";
   const abs = await resolveInside(root, path).catch(() => "");
   if (!abs) return json(res, 400, { error: "bad path" });
   const rel = relative(root, abs);
-  const work = runGit(root, ["diff", "--", rel]);
-  const cached = runGit(root, ["diff", "--cached", "--", rel]);
-  // Кусок из индекса откатывается иначе, чем кусок рабочей копии
+  const work = runGit(root, ["diff", ...DIFF_ARGS, "--", rel]);
+  const cached = runGit(root, ["diff", ...DIFF_ARGS, "--cached", "--", rel]);
+  // Изменение из индекса откатывается иначе, чем изменение рабочей копии
   // (см. handleRevertHunk), поэтому два diff'а отдаются раздельно — по «diff»
   // клиент их не различил бы.
   const cachedDiff = cached.ok ? cached.output : "";
@@ -515,12 +543,12 @@ async function handleGitDiff(root, url, res) {
   json(res, 200, { ok: true, path: rel, diff: cachedDiff + workDiff, cachedDiff, workDiff });
 }
 
-// Откат ОДНОГО куска диффа к состоянию HEAD.
-//   source = "index"    — кусок лежит в индексе (git add): откатываем индекс И
+// Откат ОДНОГО изменения диффа к состоянию HEAD.
+//   source = "index"    — изменение лежит в индексе (git add): откатываем индекс И
 //                         файл одной операцией (git apply -R --index);
 //   source = "worktree" — только рабочая копия.
-// Клиент присылает НОМЕР куска и его строку «@@»: diff берётся заново, и если
-// по этому номеру лежит уже другой кусок — отказ (файл изменился, пока
+// Клиент присылает НОМЕР изменения и его строку «@@»: diff берётся заново, и если
+// по этому номеру лежит уже другой изменение — отказ (файл изменился, пока
 // рисовался вид; откатывать вслепую нельзя).
 async function handleRevertHunk(root, req, res) {
   try {
@@ -529,7 +557,7 @@ async function handleRevertHunk(root, req, res) {
     const rel = relative(root, abs);
     const source = body.source === "index" ? "index" : "worktree";
     const index = Number(body.index);
-    const diff = runGit(root, source === "index" ? ["diff", "--cached", "--", rel] : ["diff", "--", rel]);
+    const diff = runGit(root, ["diff", ...DIFF_ARGS, ...(source === "index" ? ["--cached"] : []), "--", rel]);
     if (!diff.ok) return json(res, 400, { ok: false, error: "git diff не отработал" });
     const { header, hunks } = splitDiffHunks(diff.output);
     if (!Number.isInteger(index) || index < 0 || index >= hunks.length) {
@@ -543,7 +571,7 @@ async function handleRevertHunk(root, req, res) {
     mkdirSync(LOG_DIR, { recursive: true });
     const patchFile = join(LOG_DIR, "revert-hunk.patch");
     writeFileSync(patchFile, header + hunk, "utf-8");
-    const args = ["apply", "-R", "--whitespace=nowarn"];
+    const args = ["apply", "-R", "--unidiff-zero", "--whitespace=nowarn"];
     if (source === "index") args.push("--index");
     args.push(patchFile);
     const applied = runGitErr(root, args);
@@ -557,7 +585,7 @@ async function handleRevertHunk(root, req, res) {
 
 // Откат файла целиком к HEAD — индекс и рабочая копия одним движением
 // (как «Undo File» в Cursor: правок в файле не остаётся). Новый (untracked)
-// файл сюда не попадает: версии в HEAD у него нет и кусков диффа тоже нет.
+// файл сюда не попадает: версии в HEAD у него нет и изменений диффа тоже нет.
 async function handleRevertFile(root, req, res) {
   try {
     const body = JSON.parse(await readBody(req));
@@ -572,15 +600,69 @@ async function handleRevertFile(root, req, res) {
   }
 }
 
-// Отметки «просмотрено» для кусков диффа. Живут на машине, не в проекте:
-// %LOCALAPPDATA%/dsh-bsl-editor/reviewed.json → { root: { <rel>: { headSha, hashes } } }.
+// Отметки «просмотрено» для изменений диффа. Живут на машине, не в проекте:
+// %LOCALAPPDATA%/dsh-bsl-editor/reviewed.json → { root: { <rel>: { headSha, marks } } }.
 // Ключ включает HEAD: после коммита отметки прошлой ревизии не значат ничего.
+// В marks хранится id изменения (для подсветки) и его СЫРОЙ текст (заголовок «@@» и
+// строки тела): по тексту хост отбирает, что отправить в индекс, — точное
+// совпадение содержимого, без второго разбора diff'а на стороне хоста.
 const REVIEWED_FILE = join(LOG_DIR, "reviewed.json");
 function loadReviewed() {
   try {
     const o = JSON.parse(readFileSync(REVIEWED_FILE, "utf-8"));
     return o && typeof o === "object" ? o : {};
   } catch { return {}; }
+}
+
+// Отпечатки одного изменения: по телу (без строки «@@») и по всему тексту.
+// Второй вариант читают отметки, записанные прежними сборками.
+function hunkKeysOf(lines) {
+  return [hashChunk(lines.slice(1).join("\n")), hashChunk(lines.join("\n"))];
+}
+
+// Изменения файла прямо сейчас: рабочая копия и индекс. По ним опознаётся, что
+// ещё живо, а что уже ушло из файла (в коммит или под чужую правку).
+function changeIndex(root, rel) {
+  const workDiff = splitDiffHunks(runGit(root, ["diff", ...DIFF_ARGS, "--", rel]).output || "");
+  const idxDiff = splitDiffHunks(runGit(root, ["diff", "--cached", ...DIFF_ARGS, "--", rel]).output || "");
+  const keys = new Set();
+  const texts = new Set();
+  for (const lines of [...workDiff.hunks, ...idxDiff.hunks]) {
+    for (const k of hunkKeysOf(lines)) keys.add(k);
+    texts.add(lines.join("\n"));
+  }
+  return { workDiff, idxDiff, keys, texts };
+}
+
+// Изменение отметки ещё есть в файле?
+function markInFile(idx, m) {
+  if (typeof m.fp === "string" && m.fp) return idx.keys.has(m.fp);
+  if (typeof m.text === "string" && m.text) return idx.texts.has(m.text);
+  return false; // отметка без отпечатка и без текста: сверять не с чем
+}
+
+// Отметки прошлой ревизии (после коммита) держим ровно те, чьё изменение в файле
+// осталось. Коммит не должен стирать отметки у правок, которые в индекс ещё не
+// попали: человек их уже посмотрел. Уходят те, что уехали в коммит, и те, что
+// кто-то правил после просмотра. Отметки прежних сборок (без отпечатка и текста)
+// оставляем — сверить их нечем, а лишними на экране они не бывают: правки под них
+// в файле уже нет, и клиент уберёт их сам при первой же записи.
+function pruneReviewed(root, rel) {
+  const store = loadReviewed();
+  const forRoot = store[root] && store[root][rel] ? store[root] : null;
+  if (!forRoot) return [];
+  const entry = forRoot[rel];
+  const idx = changeIndex(root, rel);
+  const live = (Array.isArray(entry.marks) ? entry.marks : []).filter((m) => {
+    const known = (typeof m.fp === "string" && m.fp) || (typeof m.text === "string" && m.text);
+    return known ? markInFile(idx, m) : true;
+  });
+  if (live.length) forRoot[rel] = { headSha: headOf(root), marks: live, hashes: live.map((m) => m.id) };
+  else delete forRoot[rel];
+  if (!Object.keys(forRoot).length) delete store[root];
+  mkdirSync(LOG_DIR, { recursive: true });
+  writeFileSync(REVIEWED_FILE, JSON.stringify(store, null, 2) + "\n", "utf-8");
+  return live;
 }
 async function handleReviewed(root, req, url, res) {
   const head = runGit(root, ["rev-parse", "HEAD"]);
@@ -590,12 +672,32 @@ async function handleReviewed(root, req, url, res) {
       const body = JSON.parse(await readBody(req));
       const abs = await resolveInside(root, String(body.path || ""));
       const rel = relative(root, abs).replace(/\\/g, "/");
-      const hashes = Array.isArray(body.hashes)
-        ? body.hashes.filter((h) => typeof h === "string" && h.length < 64).slice(0, 5000)
-        : [];
+      // Новый формат — marks; старый (только хеши) принимаем, чтобы клиент
+      // прошлой сборки не остался без отметок.
+      // Отметки собираем по id: сначала всё, что клиент считает просмотренным
+      // (hashes), затем поверх — отпечатки тех изменений, что он видит сейчас.
+      // Так отметка не пропадает оттого, что изменения нет в кадре (другая вкладка,
+      // показанные просмотренные), а для индексации достаточно отпечатка.
+      const byId = new Map();
+      if (Array.isArray(body.hashes)) {
+        for (const id of body.hashes.slice(0, 5000)) {
+          if (typeof id === "string" && id.length < 64) byId.set(id, { id });
+        }
+      }
+      if (Array.isArray(body.marks)) {
+        for (const m of body.marks.slice(0, 5000)) {
+          if (!m || typeof m.id !== "string" || m.id.length >= 64) continue;
+          const prev = byId.get(m.id) || { id: m.id };
+          if (typeof m.fp === "string" && m.fp.length < 32) prev.fp = m.fp;
+          else if (typeof m.text === "string") prev.text = m.text.slice(0, 20000); // старый формат
+          byId.set(m.id, prev);
+        }
+      }
+      const marks = [...byId.values()];
+      const hashes = marks.map((m) => m.id);
       const store = loadReviewed();
       const forRoot = store[root] && typeof store[root] === "object" ? store[root] : {};
-      if (hashes.length) forRoot[rel] = { headSha, hashes };
+      if (marks.length) forRoot[rel] = { headSha, marks, hashes };
       else delete forRoot[rel];
       if (Object.keys(forRoot).length) store[root] = forRoot;
       else delete store[root];
@@ -611,12 +713,204 @@ async function handleReviewed(root, req, url, res) {
     const abs = await resolveInside(root, path);
     const rel = relative(root, abs).replace(/\\/g, "/");
     const entry = loadReviewed()[root]?.[rel];
-    const hashes = entry && entry.headSha === headSha && Array.isArray(entry.hashes) ? entry.hashes : [];
-    json(res, 200, { ok: true, headSha, hashes });
+    // Отметки прошлой ревизии не выбрасываем подчистую: те, чьё изменение в файле
+    // осталось (ещё не в индексе), должны пережить коммит. Разбирает pruneReviewed.
+    const marks = !entry
+      ? []
+      : entry.headSha === headSha
+        ? (Array.isArray(entry.marks) ? entry.marks : [])
+        : pruneReviewed(root, rel);
+    json(res, 200, { ok: true, headSha, hashes: marks.map((m) => m.id) });
   } catch (e) {
     json(res, 400, { ok: false, error: e?.message || String(e) });
   }
 }
+
+// --- Индексация просмотренного и коммит ------------------------------------
+
+function headOf(root) {
+  const h = runGit(root, ["rev-parse", "HEAD"]);
+  return h.ok ? h.output.trim() : "";
+}
+
+// Новый файл (??) — его в индексе видно целиком: базы для diff'а у него нет.
+function isUntracked(root, rel) {
+  const st = runGit(root, ["status", "--porcelain", "--", rel]);
+  return st.ok && String(st.output).trim().startsWith("??");
+}
+
+function reviewedMarks(root, rel, headSha) {
+  const entry = loadReviewed()[root]?.[rel];
+  if (!entry) return [];
+  // Отметки живут по изменениям, а не по ревизии: после коммита отмечать заново
+  // нужно только то, что в индекс не попало, — остальное человек уже посмотрел.
+  return entry.headSha === headSha ? (Array.isArray(entry.marks) ? entry.marks : []) : pruneReviewed(root, rel);
+}
+
+// Отправить в индекс ПРОСМОТРЕННЫЕ изменения одного файла: остальные строки файла
+// остаются как были. Один патч на файл — git проверяет его целиком, и отбор
+// идёт по точному отпечатку изменения, поэтому устаревшая отметка просто не
+// найдётся, а не отправит в индекс чужие строки. Новый файл индексируется
+// целиком.
+//
+// Изменения ищем в ДВУХ источниках: в рабочей копии (их и отправляем) и в индексе.
+// Второй нужен, чтобы не называть ошибкой то, что ошибкой не является: изменение,
+// уже лежащий в индексе (его отправили раньше), попадал в «не совпали», и
+// человек читал «файл менялся после просмотра» там, где файл не менялся.
+async function stageOneFile(root, rel) {
+  try {
+    if (isUntracked(root, rel)) {
+      const add = runGitErr(root, ["add", "--", rel]);
+      if (!add.ok) return { error: add.err || "git add не прошёл" };
+      return { untracked: true, staged: 1, skipped: 0, inIndex: 0 };
+    }
+    const marks = reviewedMarks(root, rel, headOf(root));
+    if (!marks.length) return { staged: 0, skipped: 0, inIndex: 0, reason: "no-marks", marks: 0, hunks: 0 };
+    const { workDiff, idxDiff, keys: knownKeys, texts: knownTexts } = changeIndex(root, rel);
+    const markFp = new Set(marks.filter((m) => typeof m.fp === "string" && m.fp).map((m) => m.fp));
+    const byText = new Set(marks.filter((m) => typeof m.text === "string" && m.text).map((m) => m.text));
+    const matches = (lines) => hunkKeysOf(lines).some((k) => markFp.has(k)) || byText.has(lines.join("\n"));
+    const picked = workDiff.hunks.filter(matches).map((lines) => lines.join("\n"));
+    const inIndex = idxDiff.hunks.filter(matches).length;
+    // Отметка, которой нет ни в рабочей копии, ни в индексе: вот это и есть
+    // «правку меняли после просмотра». Отметки без отпечатка и без текста сюда
+    // не попадают вовсе: сверять их не с чем, и говорить про них «не совпала»
+    // нельзя — именно из-за них отчёт говорил «9 изменений не совпали», хотя файл
+    // никто не менял.
+    const skipped = marks.filter((m) => {
+      if (typeof m.fp === "string" && m.fp) return !knownKeys.has(m.fp);
+      if (typeof m.text === "string" && m.text) return !knownTexts.has(m.text);
+      return false;
+    }).length;
+    if (!picked.length) {
+      return {
+        staged: 0,
+        skipped,
+        inIndex,
+        marks: marks.length,
+        hunks: workDiff.hunks.length,
+        // Причины те же, что и раньше (старый клиент читает именно их);
+        // подробности — в числах staged/skipped/inIndex.
+        reason: workDiff.hunks.length ? "no-match" : "no-diff",
+      };
+    }
+    mkdirSync(LOG_DIR, { recursive: true });
+    const patchFile = join(LOG_DIR, "stage.patch");
+    writeFileSync(patchFile, workDiff.header + picked.map((t) => t + "\n").join(""), "utf-8");
+    const applied = runGitErr(root, ["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", patchFile]);
+    if (!applied.ok) return { error: applied.err || "git apply --cached не прошёл" };
+    return {
+      staged: picked.length,
+      skipped,
+      inIndex,
+      marks: marks.length,
+      hunks: workDiff.hunks.length,
+      reason: "ok",
+    };
+  } catch (e) {
+    return { error: e?.message || String(e) };
+  }
+}
+
+async function handleStage(root, req, res) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const abs = await resolveInside(root, String(body.path || ""));
+    const rel = relative(root, abs).replace(/\\/g, "/");
+    const r = await stageOneFile(root, rel);
+    if (r.error) return json(res, 400, { ok: false, error: r.error });
+    gitStatusCache.delete(root);
+    json(res, 200, {
+      ok: true,
+      staged: r.staged || 0,
+      skipped: r.skipped || 0,
+      inIndex: r.inIndex || 0,
+      untracked: !!r.untracked,
+      reason: r.reason || "",
+      marks: r.marks || 0,
+      hunks: r.hunks || 0,
+    });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
+}
+
+// «Всё просмотренное — в индекс» по всем изменённым файлам проекта. Новые файлы
+// сюда не попадают: у них отметок нет, индексируются кнопкой в своей вкладке.
+async function handleStageAll(root, res) {
+  try {
+    const st = runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+    if (!st.ok) return json(res, 400, { ok: false, error: "git status не отработал" });
+    // В -z каждая запись — «XY путь»; у переименований следом идёт поле без
+    // статуса, поэтому берём только строки с настоящим статусом.
+    const rels = String(st.output)
+      .split("\0")
+      .filter((e) => /^[ MADRCU?!]{2} /.test(e))
+      .map((e) => e.slice(3))
+      .filter((rel) => rel && !isUntracked(root, rel));
+    let staged = 0;
+    let skipped = 0;
+    let noMarks = 0;
+    let already = 0;
+    let inIndex = 0;
+    let noMatch = 0;
+    const files = [];
+    const failed = [];
+    for (const rel of rels) {
+      const r = await stageOneFile(root, rel);
+      if (r.error) { failed.push(rel + ": " + r.error); continue; }
+      if (r.staged) { staged += r.staged; files.push(rel); }
+      else if (r.reason === "no-marks") noMarks++;
+      else if (r.reason === "no-diff" || r.reason === "in-index") already++;
+      else if (r.reason === "no-match") noMatch++;
+      skipped += r.skipped || 0;
+      inIndex += r.inIndex || 0;
+    }
+    if (staged) gitStatusCache.delete(root);
+    json(res, 200, { ok: true, staged, skipped, inIndex, files, failed, noMarks, already, noMatch });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
+}
+
+// Что лежит в индексе — для окна коммита.
+function handleStaged(root, res) {
+  const num = runGit(root, ["diff", "--cached", "--numstat"]);
+  const files = [];
+  if (num.ok) {
+    for (const line of String(num.output).split("\n")) {
+      if (!line.trim()) continue;
+      const parts = line.split("\t");
+      if (parts.length < 3) continue;
+      files.push({
+        path: parts.slice(2).join("\t"),
+        added: parts[0] === "-" ? 0 : Number(parts[0]) || 0,
+        removed: parts[1] === "-" ? 0 : Number(parts[1]) || 0,
+      });
+    }
+  }
+  json(res, 200, { ok: true, files });
+}
+
+// Коммит индекса. Сообщение приходит от человека: своего текста мы не
+// придумываем, а без сообщения и без содержимого в индексе коммита не будет.
+async function handleCommit(root, req, res) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const message = String(body.message || "").replace(/\r\n/g, "\n").trim();
+    if (!message) return json(res, 400, { ok: false, error: "нужно сообщение коммита" });
+    const idx = runGit(root, ["diff", "--cached", "--name-only"]);
+    const files = idx.ok ? String(idx.output).split("\n").filter(Boolean) : [];
+    if (!files.length) return json(res, 400, { ok: false, error: "в индексе ничего нет" });
+    const r = runGitErr(root, ["commit", "-m", message]);
+    if (!r.ok) return json(res, 400, { ok: false, error: r.err || "git commit не прошёл" });
+    gitStatusCache.delete(root);
+    json(res, 200, { ok: true, files: files.length, summary: String(r.out).split("\n")[0] || "" });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
+  }
+}
+
 
 // --- 1C metadata tree (see metadata.js) ------------------------------------
 
@@ -980,6 +1274,22 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/reviewed",
     handler: (req, res) => handleReviewed(root, req, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/stage",
+    handler: (req, res) => handleStage(root, req, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/stage-all",
+    handler: (req, res) => handleStageAll(root, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/staged",
+    handler: (_req, res) => handleStaged(root, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/commit",
+    handler: (req, res) => handleCommit(root, req, res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/meta/status",

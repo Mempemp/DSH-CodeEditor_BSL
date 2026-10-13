@@ -29,6 +29,11 @@ window.__ModuleLoader__.load({
       ]});
     }
 
+    // Сколько висит сообщение поверх редактора, если человек его не закрыл.
+    const NOTICE_MS = 6000;
+    // Крестик закрытия у плашки сообщения.
+    const NOTICE_CLOSE_CSS = { pointerEvents: "auto", flexShrink: 0, cursor: "pointer", opacity: 0.55, padding: "0 2px", lineHeight: 1 };
+
     // Transient toast (fixed, bottom-centre) for editor actions.
     function showToast(msg) {
       let t = document.querySelector("[data-bsl-toast]");
@@ -596,9 +601,9 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // Короткий хеш содержимого куска (FNV-1a): по нему кусок опознаётся между
+    // Короткий хеш содержимого изменения (FNV-1a): по нему изменение опознаётся между
     // перерисовками — номера строк при правках выше по файлу «плывут», а текст
-    // куска остаётся тем же.
+    // изменения остаётся тем же.
     function hashChunk(s) {
       let h = 2166136261;
       for (let i = 0; i < s.length; i++) {
@@ -608,13 +613,71 @@ window.__ModuleLoader__.load({
       return (h >>> 0).toString(36);
     }
 
-    // Разбор unified diff на куски. Каждый кусок знает: свой номер внутри
+    // Слияние отметок «просмотрено». Ответ сервера НЕ затирает то, что уже
+    // отмечено здесь: запрос мог уйти раньше нашей записи отметки (запись —
+    // «выстрелил и забыл»), и тогда принятый изменение возвращался в счётчик, а
+    // следующая запись уносила на диск уже урезанный набор. Смена HEAD —
+    // единственный законный сброс: сравнивать становится не с чем.
+    function mergeReviewedHashes(prevHashes, prevHeadSha, serverHashes, serverHeadSha) {
+      const merged = new Set(Array.isArray(serverHashes) ? serverHashes : []);
+      if (serverHeadSha && prevHeadSha && serverHeadSha !== prevHeadSha) return merged;
+      for (const id of prevHashes || []) merged.add(id);
+      return merged;
+    }
+
+    // Русская форма слова при числе: 1 изменение, 2 изменения, 5 изменений.
+    function pluralRu(n, one, few, many) {
+      const n10 = n % 10;
+      const n100 = n % 100;
+      if (n10 === 1 && n100 !== 11) return one;
+      if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+      return many;
+    }
+    const changesWord = (n) => pluralRu(n, "изменение", "изменения", "изменений");
+
+    // Что сказать человеку про «В индекс». Слова здесь те же, что на экране:
+    // «изменение» — блок правки, который отмечают кнопкой «Принять», «индекс» —
+    // то, куда ведёт сама кнопка. Своих внутренних слов («изменение», «не совпало»)
+    // в тексте нет: человек не знает, что так что-то называется внутри, и
+    // читает их как вырванные из контекста.
+    function stageReasonText(data) {
+      const d = data || {};
+      const parts = [];
+      if (d.staged) parts.push(d.untracked ? "Новый файл добавлен в индекс целиком" : "В индекс отправлено " + d.staged + " " + changesWord(d.staged));
+      if (d.inIndex) parts.push(d.staged ? "ещё " + d.inIndex + " " + changesWord(d.inIndex) + " были в индексе раньше" : d.inIndex + " " + changesWord(d.inIndex) + " уже в индексе");
+      if (d.skipped) parts.push(d.skipped + " " + changesWord(d.skipped) + " отправить не удалось — файл правился после просмотра, обновите вид и отметьте их заново");
+      if (parts.length) return parts.join("; ");
+      if (d.reason === "no-marks") return "Нет просмотренных изменений — отметьте их кнопкой «Принять»";
+      if (d.reason === "no-match") return "Отправлять нечего: изменений, которые вы отметили, в файле уже нет — обновите вид и отметьте заново";
+      return "Отправлять нечего";
+    }
+
+    // То же для кнопки по всем изменённым файлам.
+    function stageAllReasonText(data) {
+      const d = data || {};
+      if (Array.isArray(d.failed) && d.failed.length) return "Не удалось отправить: " + d.failed.join("; ");
+      const parts = [];
+      if (d.staged) parts.push("В индекс отправлено " + d.staged + " " + changesWord(d.staged));
+      if (d.skipped) parts.push(d.skipped + " " + changesWord(d.skipped) + " отправить не удалось — файлы правились после просмотра, обновите вид");
+      if (parts.length) return parts.join("; ");
+      if (d.already && !d.noMarks) return "Все просмотренные изменения уже в индексе";
+      if (d.noMarks) return "Нет просмотренных изменений — отметьте их кнопкой «Принять»";
+      if (d.inIndex) return d.inIndex + " " + changesWord(d.inIndex) + " уже в индексе";
+      if (d.noMatch) return "Просмотренные изменения отправить не удалось — файлы правились после просмотра, обновите вид";
+      return "Отправлять нечего";
+    }
+
+    // Разбор unified diff на изменения. Каждый изменение знает: свой номер внутри
     // источника (для отката), строку «@@» (сверка перед откатом), строки новой
     // версии с добавленным текстом, блоки удалённых строк и хеш содержимого
-    // (отметка «просмотрено»). source: "index" — кусок из индекса (git add),
+    // (отметка «просмотрено»). source: "index" — изменение из индекса (git add),
     // "worktree" — из рабочей копии; откатываются они по-разному.
     function parseDiffHunks(diff, source) {
       const lines = String(diff || "").split("\n");
+      // Дифф кончается переводом строки: в конце остаётся пустой «хвост». Если его
+      // не отбросить, он прилипает к ПОСЛЕДНЕМУ изменению в файле — и у того же
+      // изменения в другом диффе (там оно не последнее) отпечаток получается другим.
+      if (lines.length && lines[lines.length - 1] === "") lines.pop();
       const hunks = [];
       let cur = null;
       let index = -1;
@@ -633,11 +696,17 @@ window.__ModuleLoader__.load({
             added: [],        // текст добавленных строк
             addedLines: [],   // их номера в новой версии
             delRuns: [],      // [{ afterLine, lines[] }] — блоки удалённых строк
+            // Тело изменения — строки БЕЗ заголовка «@@»: по нему считается
+            // отпечаток отметки. Номера в заголовке у двух диффов разные (один
+            // считается от индекса, другой от HEAD), поэтому отпечаток вместе с
+            // заголовком не находил своё же изменение в индексе после отправки.
+            text: [],
           };
           hunks.push(cur);
           continue;
         }
         if (!cur) continue;
+        cur.text.push(l);
         if (l.startsWith("+")) {
           cur.addedLines.push(cur.newLine);
           cur.added.push(l.slice(1));
@@ -655,11 +724,40 @@ window.__ModuleLoader__.load({
         }
       }
       for (const h of hunks) {
-        // Кнопки ставим над куском: первая строка изменения в новой версии.
-        h.anchorLine = Math.max(1, h.newStart);
-        h.id = hashChunk(h.source + "\u0000" + h.delRuns.map((r) => r.lines.join("\n")).join("\u0001") + "\u0000" + h.added.join("\n"));
+        // Якорь изменения (кнопки и стрелки) — первая ИЗМЕНЁННАЯ строка: у изменения с
+        // добавлениями это первая добавленная, у чистого удаления — строка под
+        // красным блоком. Заголовок @@ отсчитывается от первой строки КОНТЕКСТА
+        // (git даёт три), поэтому по нему якорь уводил на три строки выше.
+        h.anchorLine = h.addedLines.length
+          ? Math.min(...h.addedLines)
+          : Math.max(1, h.delRuns.length ? h.delRuns[0].afterLine : h.newStart);
+        // Хеш отметки — по СОДЕРЖИМОСТИ изменения, без источника: одна и та же
+        // правка в индексе и в рабочей копии должна считаться одной и той же,
+        // иначе после индексации она снова выглядит непросмотренной.
+        h.id = hashChunk(h.delRuns.map((r) => r.lines.join("\n")).join("\u0001") + "\u0000" + h.added.join("\n"));
+        // Тело изменения (без заголовка «@@») — по нему хост отбирает, что
+        // уходит в индекс, и по нему же отмечает уже отправленное.
+        h.text = h.text.join("\n");
       }
       return hunks;
+    }
+
+    // Раскладка кнопок «Отклонить/Принять» по вертикали. Правки, стоящие вплотную
+    // (лишняя пустая строка, перенос строки из таба), дают по паре кнопок на каждую,
+    // и пары наезжали друг на друга — это читается как сломанный интерфейс.
+    // items: [{ top, h }] — желаемое место и высота кнопок каждого изменения.
+    // Возвращает для каждого изменения итоговое место и признак «помещается в окно».
+    // Функция чистая: её считает тест tests/_layout.mjs.
+    function layoutHunkWidgets(items, viewH, gap = 2) {
+      const order = items.map((it, i) => ({ i, top: it.top, h: it.h })).sort((a, b) => a.top - b.top || a.i - b.i);
+      const out = new Array(items.length);
+      let floor = -Infinity;
+      for (const p of order) {
+        const top = Math.max(p.top, floor);
+        out[p.i] = { top, show: top >= 0 && top + p.h <= viewH - 1 };
+        floor = top + p.h + gap;
+      }
+      return out;
     }
 
     function EditorView(props) {
@@ -700,6 +798,32 @@ window.__ModuleLoader__.load({
       const [metaLoading, setMetaLoading] = useState(false);
       const [metaHighlight, setMetaHighlight] = useState(editorPersist.metaHighlight);
       const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
+      const [noticeSticky, setNoticeSticky] = useState(false); // у плашки есть кнопка действия
+      // Сообщение поверх редактора гаснет само: плашка, которая висит, пока её
+      // не сменит следующее действие, читается как поломка («ошибка появилась
+      // и висит не уходя»). Не гаснет только карточка с кнопкой — она ждёт
+      // решения человека.
+      const noticeTimerRef = useRef(null);
+      // sticky — сообщение, которое гаснет только по решению человека (у него
+      // есть кнопка действия: «Перезагрузить с диска»).
+      const showNotice = useCallback((text, sticky = false) => {
+        if (noticeTimerRef.current) {
+          clearTimeout(noticeTimerRef.current);
+          noticeTimerRef.current = null;
+        }
+        setEditorNotice(text || null);
+        setNoticeSticky(!!text && !!sticky);
+        if (!text || sticky) return;
+        noticeTimerRef.current = setTimeout(() => {
+          noticeTimerRef.current = null;
+          setEditorNotice(null);
+        }, NOTICE_MS);
+      }, []);
+      const closeNotice = useCallback(() => {
+        externalReloadRef.current = null;
+        showNotice(null);
+      }, [showNotice]);
+      useEffect(() => () => { if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current); }, []);
       const [ctxMenu, setCtxMenu] = useState(null); // { x, y, item } — meta-tree context menu
       const [lspReady, setLspReady] = useState(false); // LSP WebSocket connected
       const [lspError, setLspError] = useState(""); // last LSP failure, shown in the status bar
@@ -729,13 +853,17 @@ window.__ModuleLoader__.load({
       const diffNavRef = useRef({ anchors: [], index: -1 }); // якоря изменений + текущий индекс (вне useState — без ререндеров)
       const diffWidgetRef = useRef(null); // overlay-виджет навигации { dom, label }
       const navigateDiffRef = useRef(null);
-      // Куски диффа открытого файла — сырьё для вида: «принять»/«отклонить»
+      // Изменения диффа открытого файла — сырьё для вида: «принять»/«отклонить»
       // перерисовывают вид отсюда, без нового запроса к git.
       const diffHunksRef = useRef([]);
-      // Отметки «просмотрено»: headSha + хеши принятых кусков + показывать ли
+      // Отметки «просмотрено»: headSha + хеши принятых изменений + показывать ли
       // их (по умолчанию скрыты — в файле видно только непросмотренное).
       const reviewedRef = useRef({ headSha: "", hashes: new Set(), show: false });
-      const hunkWidgetsRef = useRef([]); // overlay-виджеты «Отклонить/Принять» по кускам
+      const hunkWidgetsRef = useRef([]); // overlay-виджеты «Отклонить/Принять» по изменениям
+      // Пока запрос к хосту в пути, кнопки изменений выключены: нажатие вторым
+      // порядком отправляло устаревший номер изменения, хост отвечал «файл
+      // изменился — обновите вид», и это читалось как сломанный интерфейс.
+      const hunkBusyRef = useRef(false);
       const placeHunkWidgetsRef = useRef(null); // расстановка этих кнопок по строкам
       const acceptHunkRef = useRef(null);
       const rejectHunkRef = useRef(null);
@@ -743,6 +871,12 @@ window.__ModuleLoader__.load({
       const rejectAllTimerRef = useRef(null); // сброс «подтверждения» для «Отклонить все»
       const rejectAllArmedRef = useRef(false); // первый клик по «Отклонить все» уже сделан
       const [diffState, setDiffState] = useState({ total: 0, unresolved: 0, reviewed: 0, show: false });
+      const [commitOpen, setCommitOpen] = useState(false);
+      const [commitMsg, setCommitMsg] = useState("");
+      const [commitBusy, setCommitBusy] = useState(false);
+      const [commitError, setCommitError] = useState("");
+      const [commitFiles, setCommitFiles] = useState([]);
+      const [stageAllBusy, setStageAllBusy] = useState(false);
       const [rejectAllArmed, setRejectAllArmed] = useState(false);
       useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
       useEffect(() => { openPathRef.current = openPath; }, [openPath]);
@@ -802,12 +936,12 @@ window.__ModuleLoader__.load({
             + ".bsl-git-added-line{background:rgba(46,160,67,.15);box-shadow:inset 2px 0 0 rgba(46,160,67,.4)}"
             + ".bsl-git-del-zone{background:rgba(248,81,73,.12);overflow:hidden}"
             + ".bsl-git-del-line{color:#f88f8a;font-family:var(--monaco-monospace-font,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:14px;line-height:20px;white-space:pre;text-overflow:clip;overflow:hidden}"
-            // Принятый (просмотренный) кусок — приглушённый серый: подсветка не
+            // Принятый (просмотренный) изменение — приглушённый серый: подсветка не
             // мозолит глаза, но правку ещё видно.
             + ".bsl-git-reviewed-line{background:rgba(138,148,166,.13);box-shadow:inset 2px 0 0 rgba(138,148,166,.35)}"
             + ".bsl-git-reviewed-zone{background:rgba(138,148,166,.10)}"
             + ".bsl-git-reviewed-zone .bsl-git-del-line{color:#9aa3b2}"
-            // Кнопки у куска — overlay-виджеты: по горизонтали прижимаются
+            // Кнопки у изменения — overlay-виджеты: по горизонтали прижимаются
             // вправо (за вычетом миникарты, её ширину плагин кладёт в
             // --bsl-hunk-right), по вертикали их ставит placeHunkWidgets.
             + ".bsl-hunk-actions{position:absolute;left:auto!important;right:var(--bsl-hunk-right,26px)!important;display:inline-flex;align-items:center;gap:6px;padding-bottom:3px;pointer-events:auto}"
@@ -822,6 +956,13 @@ window.__ModuleLoader__.load({
             // Сдвигаем плашку ниже полосы вкладок: своей настройкой плагин
             // положение не сохраняет. Панель двигаем вместе с плашкой, иначе
             // они разъезжаются.
+            + ".bsl-hunk-btn:disabled{opacity:.5;cursor:default}"
+            + ".bsl-commit-box{display:flex;flex-direction:column;gap:6px;margin:0 4px 8px;padding:8px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:8px;background:var(--dsw-alias-bg-layer-2,#22242a)}"
+            + ".bsl-commit-list{max-height:110px;overflow:auto;font-size:12px;color:var(--dsw-alias-label-secondary,#8a94a6)}"
+            + ".bsl-commit-row{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+            + ".bsl-commit-msg{box-sizing:border-box;width:100%;min-height:54px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-1,#1b1d22);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family,inherit);font-size:13px;line-height:1.4}"
+            + ".bsl-commit-error{font-size:12px;color:#f44336}"
+            + ".bsl-commit-note{font-size:12px;color:var(--dsw-alias-label-secondary,#8a94a6)}"
             + ".dm-float,.dm-float-panel{top:84px!important}";
           document.head.appendChild(st);
         }
@@ -987,7 +1128,7 @@ window.__ModuleLoader__.load({
           // instead of a lonely first line.
           if (!openPathRef.current) {
             editor.setModel(null);
-            setEditorNotice("Выберите файл из дерева");
+            showNotice("Выберите файл из дерева");
           }
           // Official 1C TextMate grammar replaces the Monarch fallback once
           // the TM stack is ready (best-effort, never blocks the editor).
@@ -1057,7 +1198,7 @@ window.__ModuleLoader__.load({
             syncingNav = true;
             try { syncDiffNavRef.current?.(); placeHunkWidgetsRef.current?.(); } finally { syncingNav = false; }
           });
-          // Кнопки кусков держатся за строку сами (overlay-виджет строки не
+          // Кнопки изменений держатся за строку сами (overlay-виджет строки не
           // знает), поэтому их надо переставлять и при смене размеров редактора.
           const layoutSub = editor.onDidLayoutChange(() => { placeHunkWidgetsRef.current?.(); });
           const cursorSub = editor.onDidChangeCursorPosition((e) => {
@@ -1180,7 +1321,8 @@ window.__ModuleLoader__.load({
         if (data.content === model.getValue()) return;
         const isDirty = openBuffersRef.current.has(fullPath);
         if (isDirty) {
-          setEditorNotice("Файл изменён на диске. Ваши правки сохранены в буфере.");
+          // Ссылку на перезагрузку ставим ДО плашки: пока она стоит, сообщение
+          // не гаснет само — оно ждёт решения человека.
           externalReloadRef.current = async () => {
             try {
               const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
@@ -1197,10 +1339,11 @@ window.__ModuleLoader__.load({
               setOpenContent(data.content);
               markTabDirty(fullPath, false);
               setDirty(false);
-              setEditorNotice(null);
+              showNotice(null);
               refreshGitDecorationsRef.current?.(fullPath);
             } catch {}
           };
+          showNotice("Файл изменён на диске. Ваши правки сохранены в буфере.", true);
         } else {
           const data = await fetchJson("/bsl/read?path=" + encodeURIComponent(fullPath));
           // Контент совпал (mtime обновился без изменения текста) —
@@ -1232,7 +1375,7 @@ window.__ModuleLoader__.load({
         // Drive ALL consumers (tab highlight, refs, view-state keys) from this
         // one value — it must update on every switch, not only on first open.
         setOpenPath(fullPath);
-        setEditorNotice(null);
+        showNotice(null);
         try {
           addTab(fullPath);
           const monaco = monacoRef.current;
@@ -1361,14 +1504,14 @@ window.__ModuleLoader__.load({
             if (editorRef.current) editorRef.current.setModel(null);
             modelRef.current = null;
             resetDiffViewRef.current?.();
-            setEditorNotice("Выберите файл из дерева");
+            showNotice("Выберите файл из дерева");
             setHighlightPath(null);
           }
         }
       }, [tabs, openFile]);
 
       // Снять вид диффа с текущей модели: зоны удалённых строк, подсветка
-      // добавленных, кнопки кусков и состояние в шапке. Всё, что мы вешаем на
+      // добавленных, кнопки изменений и состояние в шапке. Всё, что мы вешаем на
       // РЕДАКТОР (а не на модель), живёт до этой чистки — при смене файла его
       // надо звать, иначе чужие зоны остаются на новом файле.
       const clearDiffView = useCallback(() => {
@@ -1401,9 +1544,9 @@ window.__ModuleLoader__.load({
       }, [clearDiffView]);
       resetDiffViewRef.current = resetDiffView;
 
-      // Отрисовка вида диффа по готовым кускам: подсветка добавленных строк,
-      // «призраки» удалённых, кнопки «Отклонить/Принять» у каждого куска,
-      // навигатор и счётчики. Принятые куски по умолчанию не рисуются вовсе —
+      // Отрисовка вида диффа по готовым изменениям: подсветка добавленных строк,
+      // «призраки» удалённых, кнопки «Отклонить/Принять» у каждого изменения,
+      // навигатор и счётчики. Принятые изменения по умолчанию не рисуются вовсе —
       // в файле остаётся только то, что ещё не посмотрели.
       const renderDiffView = useCallback((path, hunks, lineCount, isNewUntracked) => {
         const ed = editorRef.current;
@@ -1412,7 +1555,13 @@ window.__ModuleLoader__.load({
         if (!ed || !monaco || !model) return;
         const rev = reviewedRef.current;
         const isReviewed = (h) => rev.hashes.has(h.id);
-        const shown = hunks.filter((h) => rev.show || !isReviewed(h));
+        // Изменение, который лежит в индексе И уже посмотрен, из вида файла уходит:
+        // с ним всё решено — он в индексе и ждёт коммита. Без этого нажатие
+        // «В индекс» не меняло на экране ничего (тот же счётчик «Просмотрено»,
+        // те же изменения) и читалось как «кнопка не работает». Непросмотренные
+        // изменения из индекса остаются: их ещё можно принять или отклонить.
+        const live = hunks.filter((h) => h.source !== "index" || !isReviewed(h));
+        const shown = live.filter((h) => rev.show || !isReviewed(h));
 
         // 1. Подсветка добавленных строк (и «файл целиком», если он ещё не в git).
         const addedDecorations = [];
@@ -1472,7 +1621,7 @@ window.__ModuleLoader__.load({
         });
         diffZoneIdsRef.current = zoneIds;
 
-        // 3. Навигация: один якорь на кусок — кусок и есть один визуальный блок.
+        // 3. Навигация: один якорь на изменение — изменение и есть один визуальный блок.
         const anchors = shown
           .map((h) => ({ line: Math.max(1, Math.min(h.anchorLine, Math.max(lineCount, 1))), kind: h.addedLines.length ? "added" : "deleted" }))
           .sort((a, b) => a.line - b.line);
@@ -1515,7 +1664,7 @@ window.__ModuleLoader__.load({
           hostNode.style.setProperty("--bsl-hunk-right", ((mini ? mini.offsetWidth : 0) + 26) + "px");
         }
 
-        // 5. Кнопки у каждого куска: «Отклонить» / «Принять» (у просмотренного —
+        // 5. Кнопки у каждого изменения: «Отклонить» / «Принять» (у просмотренного —
         // «Вернуть»). Ставим их overlay-виджетами, а не content-виджетами: у
         // content-виджетов система координат — бесконечное полотно строк
         // (ширина 2^24), поэтому к правому краю редактора их не прижать:
@@ -1534,6 +1683,9 @@ window.__ModuleLoader__.load({
           b.title = title;
           b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); };
           b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onClick(); };
+          // Если кнопки уже заняты запросом (перерисовка в момент отправки),
+          // новая кнопка рождается выключенной: иначе нажатие пройдёт поверх.
+          b.disabled = hunkBusyRef.current;
           return b;
         };
         for (const h of shown) {
@@ -1541,13 +1693,13 @@ window.__ModuleLoader__.load({
           dom.className = "bsl-hunk-actions";
           dom.style.display = "none";
           if (isReviewed(h)) {
-            dom.appendChild(mkBtn("Вернуть", "Считать кусок непросмотренным — вернётся в подсветку", "", () => acceptHunkRef.current?.(h, false)));
+            dom.appendChild(mkBtn("Вернуть", "Считать изменение непросмотренным — оно вернётся в подсветку", "", () => acceptHunkRef.current?.(h, false)));
           } else {
-            dom.appendChild(mkBtn("Отклонить", "Вернуть этот кусок к состоянию HEAD — правка уйдёт из файла", "bsl-hunk-btn--reject", () => rejectHunkRef.current?.(h)));
-            dom.appendChild(mkBtn("Принять", "Пометить кусок просмотренным — он уйдёт из подсветки", "bsl-hunk-btn--accept", () => acceptHunkRef.current?.(h, true)));
+            dom.appendChild(mkBtn("Отклонить", "Отклонить это изменение — строки вернутся к состоянию HEAD", "bsl-hunk-btn--reject", () => rejectHunkRef.current?.(h)));
+            dom.appendChild(mkBtn("Принять", "Отметить изменение просмотренным — оно уйдёт из подсветки", "bsl-hunk-btn--accept", () => acceptHunkRef.current?.(h, true)));
           }
           const line = Math.max(1, Math.min(h.anchorLine, model.getLineCount()));
-          // Низ блока: последняя добавленная строка, а если кусок — только
+          // Низ блока: последняя добавленная строка, а если изменение — только
           // удаление, то строка-якорь (под ней и стоит красный блок).
           const endLine = h.addedLines.length ? Math.min(Math.max(...h.addedLines), model.getLineCount()) : line;
           const widget = {
@@ -1565,17 +1717,20 @@ window.__ModuleLoader__.load({
         }
         placeHunkWidgetsRef.current?.();
 
-        // 6. Состояние для шапки (кнопки по файлу целиком).
+        // 6. Состояние для шапки (кнопки по файлу целиком). Считаем по `live`:
+        // ушедшее в индекс уже не «ждущая просмотра» работа, и счётчик
+        // «Просмотрено» обязан это показать — иначе нажатие «В индекс»
+        // выглядит как будто ничего не произошло.
         const next = {
-          total: hunks.length,
-          unresolved: hunks.filter((h) => !isReviewed(h)).length,
-          reviewed: hunks.filter(isReviewed).length,
+          total: live.length,
+          unresolved: live.filter((h) => !isReviewed(h)).length,
+          reviewed: live.filter(isReviewed).length,
           show: !!rev.show,
         };
         setDiffState((prev) => (prev.total === next.total && prev.unresolved === next.unresolved && prev.reviewed === next.reviewed && prev.show === next.show ? prev : next));
       }, []);
 
-      // Кнопки куска: overlay-виджет строки не знает, поэтому ставим их сами —
+      // Кнопки изменения: overlay-виджет строки не знает, поэтому ставим их сами —
       // под блоком изменений (так просили), а если блок кончается у нижней
       // кромки и кнопки не помещаются, то над блоком. Что ушло за пределы
       // видимой области — прячем.
@@ -1591,6 +1746,7 @@ window.__ModuleLoader__.load({
         // кнопки уезжали под верхнюю кромку.
         const viewH = (hostEl && hostEl.clientHeight) || (ed.getLayoutInfo() || {}).height || 0;
         const lineH = (ed.getOption && ed.getOption(monacoRef.current?.editor?.EditorOption?.lineHeight)) || 20;
+        const items = [];
         for (const w of hunkWidgetsRef.current) {
           const dom = w.getDomNode();
           if (!dom) continue;
@@ -1603,15 +1759,59 @@ window.__ModuleLoader__.load({
           const anchor = Math.max(1, Math.min(w.line, model.getLineCount()));
           const end = Math.max(anchor, Math.min(w.endLine || anchor, model.getLineCount()));
           const endY = (ed.getTopForLineNumber(end) || 0) - scrollTop;
-          const top = endY + lineH + 2; // строго под блоком изменений
-          const fits = top >= 0 && top + w.h <= viewH - 1;
-          dom.style.top = (top | 0) + "px";
-          dom.style.display = fits ? "inline-flex" : "none";
+          items.push({ dom, h: w.h, top: endY + lineH + 2 }); // строго под блоком изменений
         }
+        const laid = layoutHunkWidgets(items, viewH);
+        items.forEach((it, i) => {
+          it.dom.style.top = (laid[i].top | 0) + "px";
+          it.dom.style.display = laid[i].show ? "inline-flex" : "none";
+        });
       }, []);
       placeHunkWidgetsRef.current = placeHunkWidgets;
 
-      // Отметка «просмотрено» по куску (+ запись отметок на диск: они живут
+      // Занять кнопки изменений на время запроса (и отпустить после): иначе
+      // второе нажатие в другом порядке уходит на устаревшем номере изменения.
+      const setHunksBusy = useCallback((busy) => {
+        hunkBusyRef.current = !!busy;
+        for (const w of hunkWidgetsRef.current) {
+          const dom = w.getDomNode && w.getDomNode();
+          if (!dom) continue;
+          for (const b of dom.querySelectorAll("button")) b.disabled = !!busy;
+        }
+      }, []);
+
+      // Отметки уезжают на хост вместе с ОТПЕЧАТКОМ текста каждого изменения: по
+      // нему хост и отбирает, что отправить в индекс (см. /bsl/stage).
+      const postReviewed = useCallback(async (path) => {
+        const rev = reviewedRef.current;
+        // В хранилище уходят только отметки, которым есть чему соответствовать
+        // — изменениям, которые сейчас есть в файле. Набор `rev.hashes` шире: он
+        // копится за сессию, и в нём остаются id правок, которых в файле уже
+        // нет (правку отклонили, или она изменилась после просмотра). Такие id
+        // никто не может сопоставить, а в отчёте «В индекс» они всплывали как
+        // «N изменений не совпали — файл менялся после просмотра», хотя файл
+        // никто не менял.
+        const liveIds = new Set(diffHunksRef.current.map((h) => h.id));
+        const marks = diffHunksRef.current
+          .filter((h) => rev.hashes.has(h.id))
+          .map((h) => ({ id: h.id, fp: hashChunk(h.text) })); // отпечаток текста, не текст
+        const hashes = [...rev.hashes].filter((id) => liveIds.has(id));
+        try {
+          const res = await fetch("/bsl/reviewed", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path, hashes, marks }),
+          });
+          // Молчать об этом нельзя: если отметки не сохранились, следующий
+          // ответ хоста вернёт принятые изменения в счётчик, и выглядит это как
+          // «кнопка сама сбрасывает просмотр».
+          if (!res.ok) console.warn("[bsl] отметки не сохранились: HTTP " + res.status);
+        } catch (e) {
+          console.warn("[bsl] отметки не сохранились: " + (e?.message || String(e)));
+        }
+      }, []);
+
+      // Отметка «просмотрено» по изменению (+ запись отметок на диск: они живут
       // между сессиями и привязаны к текущему HEAD).
       const acceptHunk = useCallback(async (hunk, accept) => {
         const path = openPathRef.current;
@@ -1621,26 +1821,22 @@ window.__ModuleLoader__.load({
         else rev.hashes.delete(hunk.id);
         const ed = editorRef.current;
         renderDiffView(path, diffHunksRef.current, ed?.getModel()?.getLineCount() || 0, false);
-        try {
-          await fetch("/bsl/reviewed", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ path, hashes: [...rev.hashes] }),
-          });
-        } catch {}
-      }, [renderDiffView]);
+        await postReviewed(path);
+      }, [renderDiffView, postReviewed]);
       acceptHunkRef.current = acceptHunk;
 
-      // Отказ куска: возврат к HEAD делает git (`git apply -R` по куску) —
+      // Отказ изменения: возврат к HEAD делает git (`git apply -R` по изменению) —
       // строки в файле меняет он, а не редактор, поэтому после отката файл
       // перечитывается с диска.
       const rejectHunk = useCallback(async (hunk) => {
         const path = openPathRef.current;
         if (!path) return;
         if (openBuffersRef.current.has(path)) {
-          setEditorNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
+          showNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
           return;
         }
+        if (hunkBusyRef.current) return;
+        setHunksBusy(true);
         try {
           const res = await fetch("/bsl/revert-hunk", {
             method: "POST",
@@ -1648,16 +1844,18 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ path, index: hunk.index, source: hunk.source, expect: hunk.header }),
           });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok || data.ok === false) setEditorNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
-          else setEditorNotice(null);
+          if (!res.ok || data.ok === false) showNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
+          else showNotice(null);
         } catch (e) {
-          setEditorNotice("Отклонить не удалось: " + (e?.message || String(e)));
+          showNotice("Отклонить не удалось: " + (e?.message || String(e)));
+        } finally {
+          setHunksBusy(false);
         }
         await revertFileRef.current?.();
-      }, []);
+      }, [setHunksBusy]);
       rejectHunkRef.current = rejectHunk;
 
-      // Файл целиком: «Принять все» — отметить просмотренными все куски;
+      // Файл целиком: «Принять все» — отметить просмотренными все изменения;
       // «Отклонить все» — вернуть файл к HEAD (git checkout HEAD -- файл).
       const acceptAllHunks = useCallback(async () => {
         const path = openPathRef.current;
@@ -1666,17 +1864,11 @@ window.__ModuleLoader__.load({
         for (const h of diffHunksRef.current) rev.hashes.add(h.id);
         const ed = editorRef.current;
         renderDiffView(path, diffHunksRef.current, ed?.getModel()?.getLineCount() || 0, false);
-        try {
-          await fetch("/bsl/reviewed", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ path, hashes: [...rev.hashes] }),
-          });
-        } catch {}
-      }, [renderDiffView]);
+        await postReviewed(path);
+      }, [renderDiffView, postReviewed]);
 
-      // Показать/спрятать просмотренные куски: спрятанные по умолчанию, а
-      // показать их нужно, чтобы вернуть ошибочно принятый кусок в работу.
+      // Показать/спрятать просмотренные изменения: спрятанные по умолчанию, а
+      // показать их нужно, чтобы вернуть ошибочно принятый изменение в работу.
       const toggleReviewedShow = useCallback(() => {
         const rev = reviewedRef.current;
         rev.show = !rev.show;
@@ -1690,9 +1882,11 @@ window.__ModuleLoader__.load({
         const path = openPathRef.current;
         if (!path) return;
         if (openBuffersRef.current.has(path)) {
-          setEditorNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
+          showNotice("Сначала сохраните файл (Ctrl+S): иначе откат потеряет несохранённые правки");
           return;
         }
+        if (hunkBusyRef.current) return;
+        setHunksBusy(true);
         try {
           const res = await fetch("/bsl/revert-file", {
             method: "POST",
@@ -1700,14 +1894,16 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ path }),
           });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok || data.ok === false) setEditorNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
-          else setEditorNotice(null);
+          if (!res.ok || data.ok === false) showNotice("Отклонить не удалось: " + (data.error || ("HTTP " + res.status)));
+          else showNotice(null);
         } catch (e) {
-          setEditorNotice("Отклонить не удалось: " + (e?.message || String(e)));
+          showNotice("Отклонить не удалось: " + (e?.message || String(e)));
+        } finally {
+          setHunksBusy(false);
         }
         reviewedRef.current.hashes = new Set();
         await revertFileRef.current?.();
-      }, []);
+      }, [setHunksBusy]);
 
       // Первый клик взводит «подтверждение» на 4 секунды, второй — откатывает
       // файл: откат стирает правки в рабочей копии без возврата.
@@ -1739,7 +1935,7 @@ window.__ModuleLoader__.load({
         if (!path) return;
         try {
           // Diff и отметки «просмотрено» — параллельно: отметки нужны, чтобы
-          // не рисовать уже посмотренные куски.
+          // не рисовать уже посмотренные изменения.
           const [data, revData] = await Promise.all([
             fetchJson("/bsl/git-diff?path=" + encodeURIComponent(path)),
             fetchJson("/bsl/reviewed?path=" + encodeURIComponent(path)).catch(() => ({ hashes: [] })),
@@ -1759,8 +1955,9 @@ window.__ModuleLoader__.load({
             return;
           }
           const rev = reviewedRef.current;
+          const prevHead = rev.headSha;
+          rev.hashes = mergeReviewedHashes(rev.hashes, prevHead, revData.hashes, revData.headSha || "");
           rev.headSha = revData.headSha || "";
-          rev.hashes = new Set(Array.isArray(revData.hashes) ? revData.hashes : []);
           // Хост отдаёт индекс и рабочую копию раздельно (откатываются они
           // по-разному). Старый хост без этих полей — diff целиком как рабочая копия.
           const cD = data.cachedDiff, wD = data.workDiff;
@@ -1795,6 +1992,123 @@ window.__ModuleLoader__.load({
         } catch {}
       }, [clearDiffView, renderDiffView]);
       refreshGitDecorationsRef.current = refreshGitDecorations;
+
+      // Проиндексировать просмотренное. В индекс уходят только помеченные
+      // изменения — остальные строки файла остаются как были; после этого они
+      // пропадают из подсветки и счётчика (у одного и того же изменения в индексе
+      // и в рабочей копии одинаковый признак содержимого). Несохранённый
+      // буфер не индексируем: в индекс ушла бы версия с диска, а не с экрана.
+      const stageFile = useCallback(async () => {
+        const path = openPathRef.current;
+        if (!path) return;
+        if (openBuffersRef.current.has(path)) {
+          showNotice("Сначала сохраните файл (Ctrl+S): иначе в индекс уйдёт версия с диска, а не то, что в редакторе");
+          return;
+        }
+        if (hunkBusyRef.current) return;
+        setHunksBusy(true);
+        try {
+          const res = await fetch("/bsl/stage", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false) {
+            showNotice("В индекс не удалось: " + (data.error || ("HTTP " + res.status)));
+            console.warn("[bsl] в индекс — ошибка", { path, status: res.status, data });
+            return;
+          }
+          // Тишина в ответ на нажатие читается как поломка кнопки: называем
+          // причину словами и всегда оставляем след в консоли.
+          console.info("[bsl] в индекс", { path, ...data });
+          showNotice(stageReasonText(data));
+          if (!data.staged && !data.untracked) return; // менять нечего
+          await refreshGitDecorationsRef.current?.(path);
+          // Новый файл уходит в индекс целиком: отмечаем его просмотренным,
+          // иначе он тут же вернётся в счётчик одним большим изменением.
+          if (data.untracked) await acceptAllHunks();
+          refreshGit();
+        } catch (e) {
+          showNotice("В индекс не удалось: " + (e?.message || String(e)));
+        } finally {
+          setHunksBusy(false);
+        }
+      }, [acceptAllHunks, refreshGit, setHunksBusy]);
+
+      // То же по всем изменённым файлам проекта разом.
+      const stageAllReviewed = useCallback(async () => {
+        if (hunkBusyRef.current) return;
+        setStageAllBusy(true);
+        setHunksBusy(true);
+        try {
+          const res = await fetch("/bsl/stage-all", { method: "POST" });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false) {
+            showNotice("В индекс не удалось: " + (data.error || ("HTTP " + res.status)));
+            return;
+          }
+          console.info("[bsl] в индекс (все изменённые файлы)", { ...data });
+          showNotice(stageAllReasonText(data));
+          const p = openPathRef.current;
+          if (p) await refreshGitDecorationsRef.current?.(p);
+          refreshGit();
+        } catch (e) {
+          showNotice("В индекс не удалось: " + (e?.message || String(e)));
+        } finally {
+          setStageAllBusy(false);
+          setHunksBusy(false);
+        }
+      }, [refreshGit, setHunksBusy]);
+
+      // Коммит: сообщение пишет человек, а окно показывает, что лежит в индексе.
+      const openCommitBox = useCallback(async () => {
+        setCommitOpen(true);
+        setCommitError("");
+        try {
+          const data = await fetchJson("/bsl/staged");
+          setCommitFiles(Array.isArray(data?.files) ? data.files : []);
+        } catch {
+          setCommitFiles([]);
+        }
+      }, []);
+      const closeCommitBox = useCallback(() => {
+        setCommitOpen(false);
+        setCommitError("");
+        setCommitMsg("");
+      }, []);
+      const doCommit = useCallback(async () => {
+        const message = commitMsg.trim();
+        if (!message) {
+          setCommitError("Напишите сообщение коммита");
+          return;
+        }
+        setCommitBusy(true);
+        setCommitError("");
+        try {
+          const res = await fetch("/bsl/commit", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ message }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false) {
+            setCommitError(data.error || ("HTTP " + res.status));
+            return;
+          }
+          setCommitOpen(false);
+          setCommitMsg("");
+          setCommitFiles([]);
+          showNotice("Закоммичено: " + (data.summary || (data.files + " файлов")));
+          const p = openPathRef.current;
+          if (p) await refreshGitDecorationsRef.current?.(p);
+          refreshGit();
+        } catch (e) {
+          setCommitError(e?.message || String(e));
+        } finally {
+          setCommitBusy(false);
+        }
+      }, [commitMsg, refreshGit]);
 
       // Persist the open model back to disk via the host /bsl/write route.
       const saveFile = useCallback(async () => {
@@ -1932,19 +2246,27 @@ window.__ModuleLoader__.load({
       gotoAnchorRef.current = gotoAnchor;
       syncDiffNavRef.current = syncDiffNav;
 
+      // Шаг считаем от КУРСОРА, а не от сохранённого индекса: после «Принять»
+      // изменение исчезает, индекс сбрасывается, и шаг от «ближайшего к центру
+      // экрана» перескакивал ближайшее изменение — счётчик при этом врал.
       const navigateDiff = useCallback((dir) => {
         const ed = editorRef.current;
-        const monaco = monacoRef.current;
         const nav = diffNavRef.current;
-        if (!ed || !monaco || !nav || !nav.anchors.length) return;
-        const n = nav.anchors.length;
-        // Стартуем от текущей позиции (syncDiffNav мог её поменять после скролла).
-        if (nav.index < 0) {
-          syncDiffNav();
+        if (!ed || !nav || !nav.anchors.length) return;
+        const anchors = nav.anchors;
+        const pos = ed.getPosition?.();
+        const cursor = pos && pos.lineNumber ? pos.lineNumber : 1;
+        let i;
+        if (dir > 0) {
+          i = anchors.findIndex((x) => x.line > cursor);
+          if (i < 0) i = 0; // ниже изменений нет — идём на первое
+        } else {
+          i = -1;
+          for (let k = 0; k < anchors.length; k++) if (anchors[k].line < cursor) i = k;
+          if (i < 0) i = anchors.length - 1; // выше изменений нет — идём на последнее
         }
-        nav.index = (((nav.index + dir) % n) + n) % n;
-        gotoAnchor(nav.index);
-      }, [gotoAnchor, syncDiffNav]);
+        gotoAnchor(i);
+      }, [gotoAnchor]);
       navigateDiffRef.current = navigateDiff;
 
       // LSP feature wiring: once Monaco exists AND the LSP client is connected,
@@ -2610,7 +2932,7 @@ window.__ModuleLoader__.load({
         // иначе запрос уйдёт со старым значением фильтра.
         gitFilterRef.current = key;
         setGitFilter(key);
-        setEditorNotice(null);
+        showNotice(null);
         if (key) refreshGit();
         // Переключение фильтра в режиме метаданных: сбросить кэш дерева,
         // чтобы оно перезагрузилось с/без changed-фильтра.
@@ -2623,23 +2945,79 @@ window.__ModuleLoader__.load({
         }
       };
       const renderGitFilter = () => jsxs("div", {
-        style: { display: "flex", gap: 4, padding: "0 4px 8px" },
-        children: gitFilterChips.map((c) => jsx("button", {
-          onClick: () => applyGitFilter(c.key),
-          style: {
-            flex: 1,
-            height: 22,
-            padding: "0 10px",
-            border: "none",
-            borderRadius: 8,
-            cursor: "pointer",
-            font: "var(--dsw-font-s-14)",
-            color: "var(--dsw-alias-label-primary)",
-            background: gitFilter === c.key ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
-            opacity: gitFilter === c.key ? 1 : 0.6,
-          },
-          children: c.label,
-        })),
+        style: { display: "flex", flexDirection: "column" },
+        children: [
+          jsxs("div", {
+            style: { display: "flex", gap: 4, padding: "0 4px 8px" },
+            children: gitFilterChips.map((c) => jsx("button", {
+              onClick: () => applyGitFilter(c.key),
+              style: {
+                flex: 1,
+                height: 22,
+                padding: "0 10px",
+                border: "none",
+                borderRadius: 8,
+                cursor: "pointer",
+                font: "var(--dsw-font-s-14)",
+                color: "var(--dsw-alias-label-primary)",
+                background: gitFilter === c.key ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
+                opacity: gitFilter === c.key ? 1 : 0.6,
+              },
+              children: c.label,
+            })),
+          }),
+          // Работа по списку изменённых файлов: отправить в индекс всё
+          // просмотренное разом и закоммитить то, что в индексе.
+          gitFilter === "*" ? jsxs("div", {
+            style: { display: "flex", gap: 6, padding: "0 4px 8px" },
+            children: [
+              jsx("button", {
+                className: "bsl-hunk-btn",
+                disabled: stageAllBusy,
+                onClick: () => stageAllReviewed(),
+                title: "Отправить в индекс просмотренные изменения всех изменённых файлов — потом их можно закоммитить",
+                children: "Всё просмотренное в индекс",
+              }),
+              jsx("button", {
+                className: "bsl-hunk-btn",
+                onClick: () => (commitOpen ? closeCommitBox() : openCommitBox()),
+                title: "Закоммитить то, что лежит в индексе",
+                children: commitOpen ? "Отмена" : "Коммит",
+              }),
+            ],
+          }) : null,
+          commitOpen ? jsxs("div", {
+            className: "bsl-commit-box",
+            children: [
+              commitFiles.length
+                ? jsx("div", {
+                    className: "bsl-commit-list",
+                    children: commitFiles.map((f) => jsx("div", {
+                      key: f.path,
+                      className: "bsl-commit-row",
+                      title: f.path,
+                      children: f.path + "  +" + f.added + " -" + f.removed,
+                    })),
+                  })
+                : jsx("div", { className: "bsl-commit-note", children: "В индексе ничего нет" }),
+              jsx("textarea", {
+                className: "bsl-commit-msg",
+                value: commitMsg,
+                placeholder: "Сообщение коммита",
+                rows: 3,
+                onChange: (e) => setCommitMsg(e.target.value),
+              }),
+              commitError ? jsx("div", { className: "bsl-commit-error", children: commitError }) : null,
+              jsx("button", {
+                className: "bsl-hunk-btn bsl-hunk-btn--accept",
+                disabled: commitBusy || !commitMsg.trim() || !commitFiles.length,
+                onClick: () => doCommit(),
+                title: "Зафиксировать индекс этим сообщением",
+                children: commitBusy ? "Коммитим…" : "Закоммитить",
+              }),
+            ],
+          }) : null,
+        ],
       });
       const relOf = (fullPath) => {
         let rel = fullPath.replace(/\\/g, "/");
@@ -2663,7 +3041,7 @@ window.__ModuleLoader__.load({
           const name = rel.slice(rel.lastIndexOf("/") + 1);
           return jsxs("div", {
             className: "dsh-bsl-row",
-            onClick: () => (deleted ? setEditorNotice("Файл удалён из рабочего дерева: " + rel) : openFile(full)),
+            onClick: () => (deleted ? showNotice("Файл удалён из рабочего дерева: " + rel) : openFile(full)),
             title: full + (deleted ? " (удалён)" : "") + "  ·  " + st,
             style: {
               boxSizing: "border-box", width: "100%", maxWidth: "100%", height: 34,
@@ -2725,7 +3103,7 @@ window.__ModuleLoader__.load({
               // Empty editor with a centered notice — no floating popup.
               if (modelRef.current) { modelRef.current.dispose?.(); modelRef.current = null; }
               if (editorRef.current) editorRef.current.setModel(null);
-              setEditorNotice("Модуль «" + item.label + "» не найден.\nОткройте XML правой кнопкой мыши.");
+              showNotice("Модуль «" + item.label + "» не найден.\nОткройте XML правой кнопкой мыши.");
               setMetaHighlight(nodeId);
             }
           : undefined;
@@ -2898,7 +3276,7 @@ window.__ModuleLoader__.load({
                   className: "bsl-hunk-btn",
                   style: { visibility: diffState.reviewed > 0 ? "visible" : "hidden" },
                   onClick: () => toggleReviewedShow(),
-                  title: diffState.show ? "Спрятать просмотренные куски" : "Показать просмотренные куски",
+                  title: diffState.show ? "Спрятать просмотренные изменения" : "Показать просмотренные изменения",
                   children: diffState.show ? "Скрыть просмотренные" : "Просмотрено: " + diffState.reviewed,
                 }),
                 jsx("button", {
@@ -2912,8 +3290,15 @@ window.__ModuleLoader__.load({
                 jsx("button", {
                   className: "bsl-hunk-btn bsl-hunk-btn--accept",
                   onClick: () => acceptAllHunks(),
-                  title: "Пометить все куски просмотренными — подсветка уйдёт",
+                  title: "Отметить все изменения просмотренными — подсветка уйдёт",
                   children: "Принять все",
+                }),
+                jsx("button", {
+                  className: "bsl-hunk-btn",
+                  style: { visibility: diffState.reviewed > 0 ? "visible" : "hidden" },
+                  onClick: () => stageFile(),
+                  title: "Отправить просмотренные изменения в индекс — потом их можно закоммитить (в списке «Изменённые»)",
+                  children: "В индекс",
                 }),
               ],
             }) : null,
@@ -2927,7 +3312,7 @@ window.__ModuleLoader__.load({
               : (rootTitle || "Проект") }),
             jsxs("div", { style: { display: "flex", gap: 4, padding: "0 4px 8px" }, children: [
               jsx("button", {
-                onClick: () => { setMode("files"); setEditorNotice(null); },
+                onClick: () => { setMode("files"); showNotice(null); },
                 style: {
                   flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
                   font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
@@ -2937,7 +3322,7 @@ window.__ModuleLoader__.load({
                 children: "Файлы",
               }),
               jsx("button", {
-                onClick: () => { setMode("meta"); setEditorNotice(null); },
+                onClick: () => { setMode("meta"); showNotice(null); },
                 style: {
                   flex: 1, height: 26, border: "none", borderRadius: 8, cursor: "pointer",
                   font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)",
@@ -2981,16 +3366,25 @@ window.__ModuleLoader__.load({
                 jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
           !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13, whiteSpace: "pre-wrap" }, children: monacoError ? "Ошибка загрузки редактора:\n" + monacoError : "Загрузка редактора…" }) : null,
           editorNotice ? (
-            externalReloadRef.current
-              ? jsxs("div", { style: { position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 10, display: "flex", alignItems: "center", gap: 10, padding: "6px 14px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", whiteSpace: "pre-wrap" }, children: [
+            noticeSticky
+              ? jsxs("div", { style: { position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 10, display: "flex", alignItems: "center", gap: 10, maxWidth: "calc(100% - 20px)", padding: "6px 14px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", whiteSpace: "pre-wrap" }, children: [
                   jsx("span", { children: editorNotice }),
                   jsx("button", {
                     onClick: () => externalReloadRef.current?.(),
                     style: { border: "none", borderRadius: 6, padding: "3px 12px", cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" },
                     children: "Перезагрузить с диска",
                   }),
+                  jsx("span", { onClick: () => closeNotice(), title: "Закрыть", style: NOTICE_CLOSE_CSS, children: "✕" }),
                 ] })
-              : jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, textAlign: "center", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-secondary, #8a94a6)", opacity: 0.8, pointerEvents: "none", whiteSpace: "pre-wrap" }, children: editorNotice })
+              // Плашка сообщения закрывается крестиком, а без него гаснет сама
+              // (NOTICE_MS): сообщение, которое висит, пока его не сменит
+              // следующее действие, читается как поломка.
+              : jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, pointerEvents: "none" }, children:
+                  jsxs("span", { style: { display: "inline-flex", alignItems: "center", gap: 10, maxWidth: "100%", padding: "6px 12px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", textAlign: "left", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", whiteSpace: "pre-wrap" }, children: [
+                    jsx("span", { children: editorNotice }),
+                    jsx("span", { onClick: () => closeNotice(), title: "Закрыть", style: NOTICE_CLOSE_CSS, children: "✕" }),
+                  ] })
+                })
           ) : null,
         ]}),
         ]}),
