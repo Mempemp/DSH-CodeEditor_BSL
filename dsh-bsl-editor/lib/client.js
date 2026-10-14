@@ -29,8 +29,12 @@ window.__ModuleLoader__.load({
       ]});
     }
 
-    // Сколько висит сообщение поверх редактора, если человек его не закрыл.
-    const NOTICE_MS = 6000;
+    // Сколько висит подсказка сверху, если человек её не закрыл. Дольше — мешает:
+    // сообщение о результате человек читает один раз.
+    const NOTICE_MS = 5000;
+    // Сколько подсказка затухает, прежде чем её уберут с экрана. Тот же порядок,
+    // что у появления: 200 мс — переход виден, но не задерживает.
+    const NOTICE_FADE_MS = 200;
     // Крестик закрытия у плашки сообщения.
     const NOTICE_CLOSE_CSS = { pointerEvents: "auto", flexShrink: 0, cursor: "pointer", opacity: 0.55, padding: "0 2px", lineHeight: 1 };
 
@@ -799,11 +803,23 @@ window.__ModuleLoader__.load({
       const [metaHighlight, setMetaHighlight] = useState(editorPersist.metaHighlight);
       const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
       const [noticeSticky, setNoticeSticky] = useState(false); // у плашки есть кнопка действия
-      // Сообщение поверх редактора гаснет само: плашка, которая висит, пока её
-      // не сменит следующее действие, читается как поломка («ошибка появилась
-      // и висит не уходя»). Не гаснет только карточка с кнопкой — она ждёт
-      // решения человека.
-      const noticeTimerRef = useRef(null);
+      const [noticeLeaving, setNoticeLeaving] = useState(false); // плашка затухает перед уборкой
+      // Подсказка сверху гаснет сама: плашка, которая висит, пока её не сменит
+      // следующее действие, читается как поломка («ошибка появилась и висит не
+      // уходя»). Не гаснет только карточка с кнопкой — она ждёт решения человека.
+      // И появление, и исчезновение — с переходом: рывок на экране читается как
+      // сбой отрисовки.
+      const noticeTimerRef = useRef(null); // авто-скрытие
+      const noticeFadeRef = useRef(null); // затухание перед уборкой
+      const fadeNoticeOut = useCallback(() => {
+        if (noticeFadeRef.current) clearTimeout(noticeFadeRef.current);
+        setNoticeLeaving(true);
+        noticeFadeRef.current = setTimeout(() => {
+          noticeFadeRef.current = null;
+          setEditorNotice(null);
+          setNoticeLeaving(false);
+        }, NOTICE_FADE_MS);
+      }, []);
       // sticky — сообщение, которое гаснет только по решению человека (у него
       // есть кнопка действия: «Перезагрузить с диска»).
       const showNotice = useCallback((text, sticky = false) => {
@@ -811,19 +827,31 @@ window.__ModuleLoader__.load({
           clearTimeout(noticeTimerRef.current);
           noticeTimerRef.current = null;
         }
+        if (noticeFadeRef.current) {
+          clearTimeout(noticeFadeRef.current);
+          noticeFadeRef.current = null;
+        }
+        setNoticeLeaving(false); // новое сообщение отменяет затухание прежнего
         setEditorNotice(text || null);
         setNoticeSticky(!!text && !!sticky);
         if (!text || sticky) return;
         noticeTimerRef.current = setTimeout(() => {
           noticeTimerRef.current = null;
-          setEditorNotice(null);
+          fadeNoticeOut();
         }, NOTICE_MS);
-      }, []);
+      }, [fadeNoticeOut]);
       const closeNotice = useCallback(() => {
         externalReloadRef.current = null;
-        showNotice(null);
-      }, [showNotice]);
-      useEffect(() => () => { if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current); }, []);
+        if (noticeTimerRef.current) {
+          clearTimeout(noticeTimerRef.current);
+          noticeTimerRef.current = null;
+        }
+        fadeNoticeOut();
+      }, [fadeNoticeOut]);
+      useEffect(() => () => {
+        if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+        if (noticeFadeRef.current) clearTimeout(noticeFadeRef.current);
+      }, []);
       const [ctxMenu, setCtxMenu] = useState(null); // { x, y, item } — meta-tree context menu
       const [lspReady, setLspReady] = useState(false); // LSP WebSocket connected
       const [lspError, setLspError] = useState(""); // last LSP failure, shown in the status bar
@@ -963,7 +991,18 @@ window.__ModuleLoader__.load({
             + ".bsl-commit-msg{box-sizing:border-box;width:100%;min-height:54px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-1,#1b1d22);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family,inherit);font-size:13px;line-height:1.4}"
             + ".bsl-commit-error{font-size:12px;color:#f44336}"
             + ".bsl-commit-note{font-size:12px;color:var(--dsw-alias-label-secondary,#8a94a6)}"
-            + ".dm-float,.dm-float-panel{top:84px!important}";
+            + ".dm-float,.dm-float-panel{top:84px!important}"
+            // Подсказка редактора: тонкой полоской сверху, под полосой вкладок, и
+            // сама гаснет (NOTICE_MS). По центру поверх кода она закрывала ровно ту
+            // строку, к которой относилась, и читалась как помеха.
+            + ".bsl-notice{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:10;max-width:calc(100% - 24px);display:flex;justify-content:center;pointer-events:none}"
+            + ".bsl-notice-pill{pointer-events:auto;display:inline-flex;align-items:center;gap:10px;padding:6px 12px;border-radius:8px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);box-shadow:0 4px 14px rgba(0,0,0,.35);text-align:left;font:var(--dsw-font-s-14);color:var(--dsw-alias-label-primary);white-space:pre-wrap;animation:bsl-notice-in .16s ease-out}"
+            // Затухание перед уборкой: исчезать рывком — то же самое, что появляться
+            // рывком. Анимируется сама плашка, а не контейнер: у контейнера
+            // transform:translateX(-50%), и keyframes с transform:none сносят центровку.
+            + ".bsl-notice-leaving .bsl-notice-pill{animation:bsl-notice-out .2s ease-in forwards}"
+            + "@keyframes bsl-notice-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}"
+            + "@keyframes bsl-notice-out{to{opacity:0;transform:translateY(-6px)}}";
           document.head.appendChild(st);
         }
         let alive = true;
@@ -3366,21 +3405,25 @@ window.__ModuleLoader__.load({
                 jsx("div", { ref: containerRef, style: { flex: 1, minWidth: 0, position: "relative" }, children: [
           !monacoReady ? jsx("div", { style: { padding: 16, opacity: 0.6, fontSize: 13, whiteSpace: "pre-wrap" }, children: monacoError ? "Ошибка загрузки редактора:\n" + monacoError : "Загрузка редактора…" }) : null,
           editorNotice ? (
+            // Обе подсказки стоят сверху, под полосой вкладок: по центру поверх кода
+            // они закрывали ту самую строку, к которой относились. Появляются и
+            // затухают плавно. Обычная гаснет сама (NOTICE_MS) и закрывается
+            // крестиком; карточка «Файл изменён на диске» с кнопкой — ждёт решения
+            // человека.
             noticeSticky
-              ? jsxs("div", { style: { position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 10, display: "flex", alignItems: "center", gap: 10, maxWidth: "calc(100% - 20px)", padding: "6px 14px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", whiteSpace: "pre-wrap" }, children: [
-                  jsx("span", { children: editorNotice }),
-                  jsx("button", {
-                    onClick: () => externalReloadRef.current?.(),
-                    style: { border: "none", borderRadius: 6, padding: "3px 12px", cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" },
-                    children: "Перезагрузить с диска",
-                  }),
-                  jsx("span", { onClick: () => closeNotice(), title: "Закрыть", style: NOTICE_CLOSE_CSS, children: "✕" }),
-                ] })
-              // Плашка сообщения закрывается крестиком, а без него гаснет сама
-              // (NOTICE_MS): сообщение, которое висит, пока его не сменит
-              // следующее действие, читается как поломка.
-              : jsx("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10, padding: 24, pointerEvents: "none" }, children:
-                  jsxs("span", { style: { display: "inline-flex", alignItems: "center", gap: 10, maxWidth: "100%", padding: "6px 12px", borderRadius: 8, background: "var(--dsw-alias-bg-layer-1)", border: "1px solid var(--dsw-alias-border-l2)", boxShadow: "0 4px 14px rgba(0,0,0,.35)", textAlign: "left", font: "var(--dsw-font-s-14)", color: "var(--dsw-alias-label-primary)", whiteSpace: "pre-wrap" }, children: [
+              ? jsx("div", { className: noticeLeaving ? "bsl-notice bsl-notice-leaving" : "bsl-notice", children:
+                  jsxs("span", { className: "bsl-notice-pill", children: [
+                    jsx("span", { children: editorNotice }),
+                    jsx("button", {
+                      onClick: () => externalReloadRef.current?.(),
+                      style: { border: "none", borderRadius: 6, padding: "3px 12px", cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" },
+                      children: "Перезагрузить с диска",
+                    }),
+                    jsx("span", { onClick: () => closeNotice(), title: "Закрыть", style: NOTICE_CLOSE_CSS, children: "✕" }),
+                  ] })
+                })
+              : jsx("div", { className: noticeLeaving ? "bsl-notice bsl-notice-leaving" : "bsl-notice", children:
+                  jsxs("span", { className: "bsl-notice-pill", children: [
                     jsx("span", { children: editorNotice }),
                     jsx("span", { onClick: () => closeNotice(), title: "Закрыть", style: NOTICE_CLOSE_CSS, children: "✕" }),
                   ] })
