@@ -787,6 +787,8 @@ window.__ModuleLoader__.load({
       // Без этого пустой список читается как «изменений нет», хотя git может
       // быть просто не найден.
       const [gitWhy, setGitWhy] = useState("");
+      const [gitInitBusy, setGitInitBusy] = useState(false);
+      const [gitInitError, setGitInitError] = useState("");
       const [rootTitle, setRootTitle] = useState("");
       const [treeError, setTreeError] = useState("");
       const [refreshBusy, setRefreshBusy] = useState(false); // идёт «Обновить дерево»
@@ -3113,11 +3115,34 @@ window.__ModuleLoader__.load({
         if (r && rel.toLowerCase().startsWith(r.toLowerCase())) rel = rel.slice(r.length).replace(/^\/+/, "");
         return rel;
       };
+      // Репозиторий — свойство конкретной папки проекта, поэтому инициализация живёт здесь, где
+      // эта папка открыта, а не в общих настройках редактора.
+      const initRepoHere = async () => {
+        setGitInitBusy(true);
+        try {
+          await fetchJson("/bsl/git-init", { method: "POST" });
+          await refreshGit(true);
+        } catch (e) {
+          setGitInitError(String((e && e.message) || e));
+        } finally {
+          setGitInitBusy(false);
+        }
+      };
       const emptyGitText = () =>
         gitWhy === "no-git"
           ? "Git не найден — путь к git.exe указывается в Settings → 1С-редактор"
           : gitWhy === "no-repo"
-          ? "Папка проекта не git-репозиторий — инициализируйте его: Settings → 1С-редактор → «Инициализировать репозиторий»"
+          ? jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
+              jsx("div", { children: "Репозитория в этой папке нет: " + (rootPath || "папка проекта не открыта") }),
+              jsx("div", { style: { opacity: 0.7 }, children: "Инициализация создаст git init, .gitignore (.dsh/, *.cfl, *.log) и первый коммит текущего состояния." }),
+              gitInitError ? jsx("div", { style: { color: "#f48771" }, children: gitInitError }) : null,
+              jsx("button", {
+                className: "bsl-hunk-btn bsl-hunk-btn--accept",
+                disabled: gitInitBusy || !rootPath,
+                onClick: () => initRepoHere(),
+                children: gitInitBusy ? "Готовим…" : "Инициализировать репозиторий",
+              }),
+            ]})
           : gitWhy === "status-failed"
           ? "git status не отработал — подробности в панели «1С-редактор» настроек"
           : "Нет изменённых файлов";
@@ -3590,20 +3615,6 @@ window.__ModuleLoader__.load({
           setGitBusy(false);
         }
       };
-      // Свежий проект: git есть, репозитория нет. Кнопка делает init, .gitignore и первый
-      // коммит на хосте, затем перечитывает состояние — иначе панель изменений остаётся пустой.
-      const initGit = async () => {
-        setGitBusy(true);
-        try {
-          await fetchJson("/bsl/git-init", { method: "POST" });
-          const d = await fetchJson("/bsl/git-info?fresh=1");
-          setGitInfo(d);
-        } catch (e) {
-          setGitInfo({ ok: false, error: String(e?.message || e) });
-        } finally {
-          setGitBusy(false);
-        }
-      };
       React.useEffect(() => {
         if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false, gitPath: cfg.gitPath || "" });
       }, [cfg]);
@@ -3653,10 +3664,9 @@ window.__ModuleLoader__.load({
           gitInfo?.git?.found
             ? jsx("code", { style: { display: "block", opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: gitInfo.git.source + ": " + (gitInfo.git.path === "git" ? "из PATH" : gitInfo.git.path) })
             : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
-          gitInfo?.git?.found && gitInfo?.repo === "" ? jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }, children: [
-            jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Папка проекта не git-репозиторий: изменениям не от чего считаться." }),
-            jsx("button", { onClick: initGit, disabled: gitBusy, style: { height: 26, padding: "0 12px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: gitBusy ? "wait" : "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: gitBusy ? "Готовим…" : "Инициализировать репозиторий" }),
-          ]}) : null,
+          // Репозиторий принадлежит папке проекта, а не редактору вообще: здесь только путь к
+          // git.exe. Инициализация — в панели изменений, где открытый проект назван путём.
+          jsx("div", { style: { opacity: 0.6, fontSize: 11, lineHeight: 1.4 }, children: "Репозиторий — свойство папки проекта. Статус и кнопка «Инициализировать репозиторий» — в панели изменений редактора, когда проект открыт." }),
           jsxs("label", { style: { display: "block" }, children: [
             jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Путь к git.exe" }),
             jsx("input", { type: "text", value: form.gitPath, onChange: (e) => setForm((f) => ({ ...f, gitPath: e.target.value })), placeholder: "(пусто = найти автоматически)", style: inputStyle }),
