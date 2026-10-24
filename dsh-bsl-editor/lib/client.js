@@ -783,8 +783,13 @@ window.__ModuleLoader__.load({
       const [saving, setSaving] = useState(false);
       const [saveError, setSaveError] = useState("");
       const [gitFiles, setGitFiles] = useState(new Map());
+      // Почему список изменений пуст: "no-git" | "no-repo" | "status-failed" | "".
+      // Без этого пустой список читается как «изменений нет», хотя git может
+      // быть просто не найден.
+      const [gitWhy, setGitWhy] = useState("");
       const [rootTitle, setRootTitle] = useState("");
       const [treeError, setTreeError] = useState("");
+      const [refreshBusy, setRefreshBusy] = useState(false); // идёт «Обновить дерево»
       const [monacoReady, setMonacoReady] = useState(false);
       const [search, setSearch] = useState(editorPersist.search);
       const [searchResults, setSearchResults] = useState([]);
@@ -1284,9 +1289,12 @@ window.__ModuleLoader__.load({
       // Зеркало gitFiles для кода вне React-рендера (разметка диффа и
       // распознавание «файл ещё не в git»).
       const gitFilesRef = useRef(new Map());
-      const refreshGit = useCallback(async () => {
+      const refreshGit = useCallback(async (fresh = false) => {
         try {
-          const data = await fetchJson("/bsl/git-status");
+          // fresh=true — из кнопки «Обновить дерево»: кэш статусов на хосте
+          // сбрасывается, иначе список изменённых пятисекундной давности.
+          const data = await fetchJson("/bsl/git-status" + (fresh ? "?fresh=1" : ""));
+          setGitWhy(data.ok ? "" : String(data.reason || ""));
           if (data.ok) {
             const m = new Map();
             for (const f of data.files) m.set(f.path, f.status);
@@ -2709,6 +2717,47 @@ window.__ModuleLoader__.load({
         }
       }, [metaExpanded, metaChildren, loadMeta]);
 
+      // Ручное обновление дерева. Свежий файл был виден только в новой сессии
+      // по двум причинам: листинги каталогов кэшируются в состоянии клиента и
+      // повторно не запрашиваются, а хост держит в памяти разобранные
+      // метаданные. Кнопка сбрасывает оба кэша и перечитывает то, что раскрыто.
+      const refreshTree = useCallback(async () => {
+        if (refreshBusy) return;
+        setRefreshBusy(true);
+        try {
+          await fetchJson("/bsl/refresh", { method: "POST" });
+          if (mode === "meta") {
+            const st = await fetchJson("/bsl/meta/status");
+            setMetaInfo(st);
+            const changed = gitFilter ? "&changed=1" : "";
+            const keys = ["", ...metaExpanded];
+            const next = new Map();
+            for (const k of keys) {
+              const data = await fetchJson("/bsl/meta/list?p=" + encodeURIComponent(k || "") + changed);
+              if (data.ok) next.set(k || "", data.items || []);
+            }
+            setMetaChildren(next);
+            setMetaError(st.ok ? "" : (st.error || "метаданные не найдены"));
+          } else {
+            const next = new Map();
+            let first = true;
+            for (const d of [rootPath || "", ...expanded]) {
+              const data = await fetchJson("/bsl/tree?path=" + encodeURIComponent(d || ""));
+              next.set(data.path, data.entries);
+              if (first) { setRootPath((prev) => prev || data.root || data.path); first = false; }
+            }
+            setChildren(next);
+            setTreeError("");
+            await refreshGit(true);
+          }
+          showNotice("Дерево обновлено");
+        } catch (e) {
+          showNotice("Обновить дерево не удалось: " + (e?.message || String(e)));
+        } finally {
+          setRefreshBusy(false);
+        }
+      }, [refreshBusy, mode, gitFilter, metaExpanded, rootPath, expanded, refreshGit, showNotice]);
+
       // On first switch to metadata mode: fetch status and the root group list.
       useEffect(() => {
         if (mode !== "meta" || metaInfo) return;
@@ -3064,9 +3113,17 @@ window.__ModuleLoader__.load({
         if (r && rel.toLowerCase().startsWith(r.toLowerCase())) rel = rel.slice(r.length).replace(/^\/+/, "");
         return rel;
       };
+      const emptyGitText = () =>
+        gitWhy === "no-git"
+          ? "Git не найден — путь к git.exe указывается в Settings → 1С-редактор"
+          : gitWhy === "no-repo"
+          ? "Папка проекта не git-репозиторий — изменениям не от чего считаться"
+          : gitWhy === "status-failed"
+          ? "git status не отработал — подробности в панели «1С-редактор» настроек"
+          : "Нет изменённых файлов";
       const renderGitList = () => {
         if (!gitFiles.size) {
-          return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6 }, children: "Нет изменённых файлов" });
+          return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6, lineHeight: 1.4 }, children: emptyGitText() });
         }
         const rows = [...gitFiles.entries()]
           .filter(([rel, st]) => statusMatches(st, gitFilter))
@@ -3346,9 +3403,29 @@ window.__ModuleLoader__.load({
         jsxs("div", { style: { display: "flex", flex: 1, minHeight: 0, minWidth: 0 }, children: [
           jsxs("div", { style: { width: treeWidth, display: "flex", flexDirection: "column", flexShrink: 0, minHeight: 0 }, children: [
           jsxs("div", { style: { padding: "2px 6px 6px", flexShrink: 0 }, children: [
-            jsx("div", { style: { padding: "0 4px 6px", fontSize: 12, opacity: 0.7 }, children: mode === "meta"
-              ? (metaInfo?.ok ? (metaInfo.configName || "Конфигурация") + " · " + (META_FORMAT_LABEL[metaInfo.format] || metaInfo.format) : "Метаданные 1С")
-              : (rootTitle || "Проект") }),
+            jsxs("div", { style: { display: "flex", alignItems: "center", gap: 6, padding: "0 4px 6px" }, children: [
+              jsx("div", { style: { flex: 1, minWidth: 0, fontSize: 12, opacity: 0.7, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: mode === "meta"
+                ? (metaInfo?.ok ? (metaInfo.configName || "Конфигурация") + " · " + (META_FORMAT_LABEL[metaInfo.format] || metaInfo.format) : "Метаданные 1С")
+                : (rootTitle || "Проект") }),
+              // Перечитать папку с диска. Без этой кнопки свежий файл появлялся
+              // только в новой сессии: листинги каталогов кэшируются, а за папкой
+              // никто не следит.
+              jsx("button", {
+                onClick: () => refreshTree(),
+                disabled: refreshBusy,
+                title: "Обновить дерево — прочитать папку заново",
+                style: {
+                  flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 20, height: 20, border: "none", borderRadius: 6,
+                  cursor: refreshBusy ? "wait" : "pointer", background: "transparent", color: "#8a94a6",
+                  padding: 0, opacity: refreshBusy ? 0.5 : 1,
+                },
+                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                  jsx("polyline", { points: "23 4 23 10 17 10" }),
+                  jsx("path", { d: "M20.49 15a9 9 0 1 1-2.12-9.36L23 10" }),
+                ] }),
+              }),
+            ]}),
             jsxs("div", { style: { display: "flex", gap: 4, padding: "0 4px 8px" }, children: [
               jsx("button", {
                 onClick: () => { setMode("files"); showNotice(null); },
@@ -3481,24 +3558,49 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", interceptChatOpen: true });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", interceptChatOpen: true, gitPath: "" });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
         fetchJson("/bsl/config").then((c) => { if (alive) setCfg(c); }).catch(() => {});
         return () => { alive = false; };
       }, []);
+      const [gitInfo, setGitInfo] = React.useState(null);
+      const [gitBusy, setGitBusy] = React.useState(false);
       React.useEffect(() => {
-        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false });
+        let alive = true;
+        fetchJson("/bsl/git-info").then((d) => { if (alive) setGitInfo(d); }).catch(() => {});
+        return () => { alive = false; };
+      }, []);
+      // Кнопка и сохраняет путь, и проверяет его же — иначе значение на экране
+      // и значение, которым работает проверка, могут разойтись.
+      const checkGit = async () => {
+        setGitBusy(true);
+        try {
+          await fetchJson("/bsl/config-save", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ gitPath: form.gitPath }),
+          });
+          const d = await fetchJson("/bsl/git-info?fresh=1");
+          setGitInfo(d);
+        } catch (e) {
+          setGitInfo({ ok: false, error: String(e?.message || e) });
+        } finally {
+          setGitBusy(false);
+        }
+      };
+      React.useEffect(() => {
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false, gitPath: cfg.gitPath || "" });
       }, [cfg]);
       const save = async () => {
         try {
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen }),
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath }),
           });
-          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen }));
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath }));
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } catch (e) {
@@ -3525,6 +3627,24 @@ window.__ModuleLoader__.load({
           jsx("input", { type: "text", value: form.serverBin, onChange: (e) => setForm((f) => ({ ...f, serverBin: e.target.value })), placeholder: "(пусто = стандартное место установки)", style: inputStyle }),
           jsx("div", { style: { marginTop: 3, opacity: 0.55, fontSize: 11, lineHeight: 1.4 }, children: "Укажите полный путь к exe, если сервер установлен не туда, где ожидается. Стандартное место после установки bsl-language-server_win.zip:" }),
           jsx("code", { style: { display: "block", marginTop: 2, opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: "%LOCALAPPDATA%\\Programs\\bsl-language-server\\bsl-language-server\\bsl-language-server.exe" }),
+        ]}),
+        // Git: диффы, индикаторы изменений, кнопки «В индекс» и «Коммит»
+        // работают только через него. Рядом с состоянием — поле пути: если
+        // git.exe лежит не там, где мы ищем, человек указывает его здесь.
+        jsxs("div", { style: { borderTop: "1px solid var(--dsw-alias-border-l2)", marginTop: 2, paddingTop: 10, display: "flex", flexDirection: "column", gap: 8 }, children: [
+          jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8 }, children: [
+            jsx("span", { children: "Git — " + (gitInfo?.git?.found ? "найден" : "не найден") }),
+            gitInfo?.git?.found ? jsx("span", { style: { opacity: 0.55, fontSize: 11 }, children: gitInfo.git.version }) : null,
+          ]}),
+          gitInfo?.git?.found
+            ? jsx("code", { style: { display: "block", opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: gitInfo.git.source + ": " + (gitInfo.git.path === "git" ? "из PATH" : gitInfo.git.path) })
+            : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
+          gitInfo?.git?.found && gitInfo?.repo === "" ? jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Папка проекта не git-репозиторий: изменениям не от чего считаться." }) : null,
+          jsxs("label", { style: { display: "block" }, children: [
+            jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Путь к git.exe" }),
+            jsx("input", { type: "text", value: form.gitPath, onChange: (e) => setForm((f) => ({ ...f, gitPath: e.target.value })), placeholder: "(пусто = найти автоматически)", style: inputStyle }),
+          ]}),
+          jsx("div", { children: jsx("button", { onClick: checkGit, disabled: gitBusy, style: { height: 28, padding: "0 14px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: gitBusy ? "wait" : "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: gitBusy ? "Проверяем…" : "Проверить снова" }) }),
         ]}),
         jsx("div", { style: { display: "flex", alignItems: "center", gap: 10 }, children: [
           jsx("button", { onClick: save, style: { height: 28, padding: "0 16px", border: "none", borderRadius: 8, cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" }, children: "Сохранить" }),

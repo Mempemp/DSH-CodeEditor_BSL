@@ -31,6 +31,8 @@ export const Config = z.object({
   lspEnabled: z.boolean().default(false),
   /** Intercept chat file-link clicks (remote.session.openWorkspacePath). */
   interceptChatOpen: z.boolean().default(true),
+  /** Explicit path to git.exe; empty = auto-resolve (bundled copy, PATH, Git for Windows). */
+  gitPath: z.string().default(""),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -386,8 +388,78 @@ async function handleStat(root, url, res) {
   }
 }
 
+// --- git: какой бинарник использовать --------------------------------------
+// Диффы, бейджи и кнопки «В индекс» / «Коммит» работают через настоящий git.
+// Порядок поиска: путь из настроек плагина → папка, куда сборка «DSH для 1С»
+// кладёт свой git (MinGit) → PATH → типовые места установки Git for Windows.
+// Найденный путь кэшируем на минуту: git на ходу не переезжает, а spawn на
+// каждый показ диффа — лишние процессы.
+// Раскладки, в которых встречается git.exe: MinGit кладёт cmd/git.exe,
+// сборки на msys2 — mingw64/ или ucrt64/bin, портативные — в корень.
+const GIT_BIN_RELATIVE = ["cmd/git.exe", "bin/git.exe", "mingw64/bin/git.exe", "ucrt64/bin/git.exe", "git.exe"];
+let gitBin = "git";
+let gitConfig = null;
+let gitResolveCache = { key: "", at: 0, info: null };
+
+function gitInstallDirs() {
+  const dshHome = process.env.DSH_HOME || join(homedir(), ".dsh");
+  const pf = process.env.ProgramFiles || "C:\\Program Files";
+  const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  const lad = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  return [
+    { dir: join(dshHome, "git"), source: "комплект DSH для 1С" },
+    { dir: join(pf, "Git"), source: "установленный Git" },
+    { dir: join(pf86, "Git"), source: "установленный Git" },
+    { dir: join(lad, "Programs", "Git"), source: "установленный Git" },
+  ];
+}
+
+function probeGitExe(exe) {
+  const r = spawnSync(exe, ["--version"], { windowsHide: true, encoding: "utf-8", timeout: 10000 });
+  if (r.error || r.status !== 0) return "";
+  return String(r.stdout || "").trim();
+}
+
+function resolveGit(config, opts = {}) {
+  const explicitPath = String(config?.gitPath || "").trim();
+  const key = explicitPath + "|" + (process.env.DSH_HOME || "");
+  if (!opts.fresh && gitResolveCache.info && gitResolveCache.key === key && Date.now() - gitResolveCache.at < 60_000) {
+    gitBin = gitResolveCache.info.found ? gitResolveCache.info.path : "git";
+    return gitResolveCache.info;
+  }
+  const tried = [];
+  const remember = (info) => {
+    gitBin = info.found ? info.path : "git";
+    gitResolveCache = { key, at: Date.now(), info };
+    return info;
+  };
+  if (explicitPath) {
+    tried.push(explicitPath);
+    const v = probeGitExe(explicitPath);
+    if (v) return remember({ found: true, path: explicitPath, version: v, source: "путь из настроек", tried });
+  }
+  for (const { dir, source } of gitInstallDirs()) {
+    for (const rel of GIT_BIN_RELATIVE) {
+      const exe = join(dir, rel);
+      if (!existsSync(exe)) continue;
+      tried.push(exe);
+      const v = probeGitExe(exe);
+      if (v) return remember({ found: true, path: exe, version: v, source, tried });
+    }
+  }
+  tried.push("git в PATH");
+  const fromPath = probeGitExe("git");
+  if (fromPath) return remember({ found: true, path: "git", version: fromPath, source: "PATH", tried });
+  return remember({ found: false, path: "", version: "", source: "", tried });
+}
+
+function ensureGitResolved() {
+  if (gitConfig && !gitResolveCache.info) resolveGit(gitConfig);
+}
+
 function runGit(root, args) {
-  const r = spawnSync("git", args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
+  ensureGitResolved();
+  const r = spawnSync(gitBin, args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
   if (r.error || r.status !== 0) return { ok: false, output: "" };
   return { ok: true, output: r.stdout ?? "" };
 }
@@ -449,15 +521,26 @@ async function handleWrite(root, req, res) {
 // на каждый клик по дереву метаданных в режиме фильтра.
 let gitStatusCache = new Map(); // root -> { at, files }
 const GIT_STATUS_TTL = 5000;
-async function handleGitStatus(root, res) {
+async function handleGitStatus(root, res, opts) {
+  // fresh=1 — явное обновление из интерфейса (кнопка «Обновить дерево»):
+  // кэш не читаем, иначе на экране остаются статусы пятисекундной давности.
+  const fresh = opts === true || (opts !== null && typeof opts === "object" && opts.fresh === true);
+  const git = resolveGit(gitConfig, { fresh });
+  // Без git показывать нечего — и молчать об этом нельзя: пустой список
+  // изменений читается как «изменений нет», хотя причина другая.
+  if (!git.found) return json(res, 200, { ok: false, files: [], git, reason: "no-git" });
+  if (fresh) gitStatusCache.delete(root);
   const cached = gitStatusCache.get(root);
   if (cached && Date.now() - cached.at < GIT_STATUS_TTL) {
-    return json(res, 200, { ok: true, files: cached.files });
+    return json(res, 200, { ok: true, files: cached.files, git });
   }
   // Новые файлы показываем всегда: --untracked-files=all перечисляет их
   // поштучно вместо свёртки каталога в одну строку "?? dir/".
   const r = runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
-  if (!r.ok) return json(res, 200, { ok: false, files: [] });
+  if (!r.ok) {
+    const repo = runGit(root, ["rev-parse", "--show-toplevel"]);
+    return json(res, 200, { ok: false, files: [], git, reason: repo.ok ? "status-failed" : "no-repo" });
+  }
   const files = [];
   const parts = r.output.split("\0");
   for (let i = 0; i < parts.length; i++) {
@@ -470,7 +553,7 @@ async function handleGitStatus(root, res) {
     if (status.startsWith("R") || status.startsWith("C")) i += 1;
   }
   gitStatusCache.set(root, { at: Date.now(), files });
-  json(res, 200, { ok: true, files });
+  json(res, 200, { ok: true, files, git });
 }
 
 // Разбор unified diff на изменения: заголовок файла («diff --git …» + «---»/«+++»)
@@ -500,7 +583,8 @@ function splitDiffHunks(diff) {
 
 // Тот же runGit, но с stderr: причина отказа git apply иначе не видна.
 function runGitErr(root, args) {
-  const r = spawnSync("git", args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
+  ensureGitResolved();
+  const r = spawnSync(gitBin, args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "", err: String(r.stderr ?? "").trim() };
 }
 
@@ -1000,6 +1084,33 @@ async function handleMetaSearch(root, url, res) {
   }
 }
 
+// Что с git: какой бинарник найден и видит ли он в папке проекта репозиторий.
+// Нужен настройкам плагина: без git диффов и кнопок индекса нет, и человек
+// должен видеть причину, а не пустой список изменений.
+async function handleGitInfo(root, url, res) {
+  const fresh = url.searchParams.get("fresh") === "1";
+  const git = resolveGit(gitConfig, { fresh });
+  let repo = "";
+  if (git.found) {
+    const r = runGit(root, ["rev-parse", "--show-toplevel"]);
+    repo = r.ok ? r.output.trim() : "";
+  }
+  json(res, 200, { ok: true, root, git, repo });
+}
+
+// Ручное обновление дерева из интерфейса: сбрасываем всё, что хост держит в
+// памяти, — статусы git, поисковый индекс и разобранные метаданные. Без этого
+// свежий файл или новый объект появлялись только в новой сессии DSH.
+async function handleRefreshAll(root, _req, res) {
+  gitStatusCache.delete(root);
+  searchIndex.builtAt = 0;
+  metaModel = null;
+  // git могли поставить, пока приложение работало.
+  gitResolveCache = { key: "", at: 0, info: null };
+  resolveGit(gitConfig, { fresh: true });
+  json(res, 200, { ok: true });
+}
+
 // Static go-to-definition via the metadata model (F12 without LSP):
 // «[Коллектор.]Модуль.Метод» resolves to the exact module; a bare method
 // name is looked up only in the currently open file.
@@ -1118,6 +1229,10 @@ export function apply(ctx, config) {
     }
   })();
   let root = config.workspaceDir || (workspaces[0]?.path ?? process.cwd());
+  // git ищем один раз на старте: настройки плагина доступны только здесь, а
+  // runGit зовётся из десятка мест и не должен каждый раз ходить по диску.
+  gitConfig = config;
+  resolveGit(config);
 
   // Warm the filename index in the background so the first search is instant.
   ensureIndex(root).catch(() => {});
@@ -1200,6 +1315,7 @@ export function apply(ctx, config) {
       serverBin: config.serverBin,
       workspaceDir: config.workspaceDir,
       sourceExtensions: config.sourceExtensions,
+      gitPath: config.gitPath || "",
     }),
   });
   ctx.webServer.register({
@@ -1216,6 +1332,7 @@ export function apply(ctx, config) {
             serverPort: patch.serverPort ?? config.serverPort,
             serverBin: patch.serverBin ?? config.serverBin,
             sourceExtensions: patch.sourceExtensions ?? config.sourceExtensions,
+            gitPath: patch.gitPath ?? config.gitPath ?? "",
           };
           mkdirSync(LOG_DIR, { recursive: true });
           writeFileSync(PLUGIN_CONFIG_FILE, JSON.stringify(next, null, 2) + "\n", "utf-8");
@@ -1257,7 +1374,7 @@ export function apply(ctx, config) {
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-status",
-    handler: (_req, res) => handleGitStatus(root, res, config),
+    handler: (req, res) => handleGitStatus(root, res, { fresh: new URL(req.url, "http://x").searchParams.get("fresh") === "1" }),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/git-diff",
@@ -1302,6 +1419,14 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/meta/search",
     handler: (req, res) => handleMetaSearch(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/refresh",
+    handler: (req, res) => handleRefreshAll(root, req, res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/git-info",
+    handler: (req, res) => handleGitInfo(root, new URL(req.url, "http://x"), res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/find-symbol",
