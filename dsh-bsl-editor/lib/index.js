@@ -1098,6 +1098,44 @@ async function handleGitInfo(root, url, res) {
   json(res, 200, { ok: true, root, git, repo });
 }
 
+// Папка проекта без репозитория — обычное состояние свежего проекта: git привозит установщик,
+// но инициализировать его было некому, и редактор только сообщал «не git-репозиторий». Теперь
+// это действие: init, локальная подпись, .gitignore и первый коммит, чтобы изменениям было от
+// чего считаться.
+async function handleGitInit(root, _req, res) {
+  const git = resolveGit(gitConfig, { fresh: true });
+  if (!git.found) {
+    json(res, 400, { ok: false, error: "git не найден: укажите путь к git.exe в настройках 1С-редактора" });
+    return;
+  }
+  const existing = runGit(root, ["rev-parse", "--show-toplevel"]);
+  if (existing.ok) {
+    json(res, 200, { ok: true, repo: existing.output.trim(), already: true });
+    return;
+  }
+  const init = runGit(root, ["init", "-b", "main"]);
+  // Git старше 2.28 не знает -b; тогда ветка останется той, что задана по умолчанию.
+  if (!init.ok && !runGit(root, ["init"]).ok) {
+    json(res, 500, { ok: false, error: "git init не отработал: " + String(init.output || "").slice(-300) });
+    return;
+  }
+  // Коммит без подписи git отвергнет: в свежей системе user.name/user.email не заданы.
+  // Правим только локальный конфиг репозитория, глобальный не трогаем.
+  if (!runGit(root, ["config", "user.name"]).output.trim()) runGit(root, ["config", "user.name", "DSH для 1С"]);
+  if (!runGit(root, ["config", "user.email"]).output.trim()) runGit(root, ["config", "user.email", "dsh-1c@local"]);
+  // .dsh хранит путь к базе; *.cfl — служебные файлы блокировки 1С, в истории им делать нечего.
+  const ignoreFile = join(root, ".gitignore");
+  if (!existsSync(ignoreFile)) writeFileSync(ignoreFile, [".dsh/", "*.cfl", "*.log", ""].join("\n"), "utf8");
+  runGit(root, ["add", "-A"]);
+  const commit = runGit(root, ["commit", "-m", "Первый коммит: исходное состояние проекта"]);
+  json(res, 200, {
+    ok: true,
+    repo: root,
+    committed: commit.ok,
+    detail: commit.ok ? "" : String(commit.output || "").slice(-300),
+  });
+}
+
 // Ручное обновление дерева из интерфейса: сбрасываем всё, что хост держит в
 // памяти, — статусы git, поисковый индекс и разобранные метаданные. Без этого
 // свежий файл или новый объект появлялись только в новой сессии DSH.
@@ -1427,6 +1465,10 @@ export function apply(ctx, config) {
   ctx.webServer.register({
     kind: "exact", path: "/bsl/git-info",
     handler: (req, res) => handleGitInfo(root, new URL(req.url, "http://x"), res),
+  });
+  ctx.webServer.register({
+    kind: "exact", path: "/bsl/git-init",
+    handler: (req, res) => handleGitInit(root, req, res),
   });
   ctx.webServer.register({
     kind: "prefix", path: "/bsl/find-symbol",
