@@ -3130,7 +3130,7 @@ window.__ModuleLoader__.load({
       };
       const emptyGitText = () =>
         gitWhy === "no-git"
-          ? "Git не найден — путь к git.exe указывается в Settings → 1С-редактор"
+          ? "Git не найден — путь к git.exe указывается в Settings → 1С-Редактор кода"
           : gitWhy === "no-repo"
           ? jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
               jsx("div", { children: "Репозитория в этой папке нет: " + (rootPath || "папка проекта не открыта") }),
@@ -3144,7 +3144,7 @@ window.__ModuleLoader__.load({
               }),
             ]})
           : gitWhy === "status-failed"
-          ? "git status не отработал — подробности в панели «1С-редактор» настроек"
+          ? "git status не отработал — подробности в панели «1С-Редактор кода» настроек"
           : "Нет изменённых файлов";
       const renderGitList = () => {
         if (!gitFiles.size) {
@@ -3634,7 +3634,7 @@ window.__ModuleLoader__.load({
       };
       const inputStyle = { boxSizing: "border-box", width: "100%", height: 28, padding: "0 8px", borderRadius: 6, border: "1px solid var(--dsw-alias-border-l2)", background: "var(--dsw-alias-bg-base)", color: "inherit", font: "var(--dsw-font-s-14)" };
       return jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 12, maxWidth: 420 }, children: [
-        jsx("div", { style: { opacity: 0.7 }, children: "Плагин 1С-редактора: файловое дерево, метаданные, Monaco + bsl-language-server" }),
+        jsx("div", { style: { opacity: 0.7 }, children: "1С-Редактор кода: файловое дерево, метаданные, Monaco + bsl-language-server" }),
         jsxs("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }, children: [
           jsx("input", { type: "checkbox", checked: form.lspEnabled, onChange: (e) => setForm((f) => ({ ...f, lspEnabled: e.target.checked })) }),
           "LSP (диагностика, автодополнение, переходы)",
@@ -3666,7 +3666,6 @@ window.__ModuleLoader__.load({
             : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
           // Репозиторий принадлежит папке проекта, а не редактору вообще: здесь только путь к
           // git.exe. Инициализация — в панели изменений, где открытый проект назван путём.
-          jsx("div", { style: { opacity: 0.6, fontSize: 11, lineHeight: 1.4 }, children: "Репозиторий — свойство папки проекта. Статус и кнопка «Инициализировать репозиторий» — в панели изменений редактора, когда проект открыт." }),
           jsxs("label", { style: { display: "block" }, children: [
             jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Путь к git.exe" }),
             jsx("input", { type: "text", value: form.gitPath, onChange: (e) => setForm((f) => ({ ...f, gitPath: e.target.value })), placeholder: "(пусто = найти автоматически)", style: inputStyle }),
@@ -3693,7 +3692,7 @@ window.__ModuleLoader__.load({
       ctx.slots.inject(
         "settings.section",
         () => ctx.slots.register(
-          { name: "settings.section", id: "dsh-bsl-editor", order: 50, label: () => "1С-редактор", registrant: "dsh-bsl-editor" },
+          { name: "settings.section", id: "dsh-bsl-editor", order: 50, label: () => "1С-Редактор кода", registrant: "dsh-bsl-editor" },
           PluginSettingsSection,
         ),
       );

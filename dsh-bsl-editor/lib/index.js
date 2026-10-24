@@ -1105,7 +1105,7 @@ async function handleGitInfo(root, url, res) {
 async function handleGitInit(root, _req, res) {
   const git = resolveGit(gitConfig, { fresh: true });
   if (!git.found) {
-    json(res, 400, { ok: false, error: "git не найден: укажите путь к git.exe в настройках 1С-редактора" });
+    json(res, 400, { ok: false, error: "git не найден: укажите путь к git.exe в настройках «1С-Редактор кода»" });
     return;
   }
   const existing = runGit(root, ["rev-parse", "--show-toplevel"]);
