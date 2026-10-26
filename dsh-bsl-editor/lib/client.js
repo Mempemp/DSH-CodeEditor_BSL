@@ -3689,6 +3689,10 @@ window.__ModuleLoader__.load({
               ? null
               : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
           gitInfo?.lastError?.text ? jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4, whiteSpace: "pre-wrap", wordBreak: "break-word" }, children: "Последняя ошибка git — " + gitInfo.lastError.text }) : null,
+          // Репозиторий — свойство папки проекта, а не редактора: настройки показывают только
+          // путь к git.exe, поэтому отсутствие репозитория здесь — состояние, а не ошибка.
+          // Инициализация живёт в панели изменений, где проект назван путём.
+          gitInfo?.notRepo ? jsx("div", { style: { opacity: 0.7, fontSize: 11, lineHeight: 1.4 }, children: "В папке проекта нет git-репозитория — инициализация в панели изменений." }) : null,
           // Отдельная подсказка только для одной причины: лок индекса остаётся от
           // прерванной операции и блокирует всё остальное, а сам git называет файл.
           gitInfo?.lastError?.text && /index\.lock/i.test(gitInfo.lastError.text)

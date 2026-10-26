@@ -476,8 +476,21 @@ const GIT_WRITE_TIMEOUT = 900_000; // add/commit на большой выгру�
 const GIT_WRITE_SUBCOMMANDS = new Set(["add", "commit", "init", "apply", "checkout", "reset"]);
 
 // Последняя ошибка git: своя формулировка («git status не отработал») ничего не
-// объясняет, а настройки показывают ровно то, что сказал git.
+// объясняет, а настройки показывают ровно то, что сказал git. Ошибка принадлежит
+// папке проекта: иначе отказ в одном проекте висел в настройках другого, где всё
+// в порядке. «Не git-репозиторий» сюда не попадает — это состояние свежего
+// проекта, а не отказ.
 let lastGitError = null;
+
+/** Ключ папки для сверки ошибок: регистр и разделители путей не должны различать проекты. */
+function gitRootKey(root) {
+  return String(root || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** Git говорит так, когда в папке (и выше) нет репозитория. */
+function isNotRepoError(text) {
+  return /not a git repositor/i.test(String(text || ""));
+}
 
 function gitTimeoutFor(args) {
   return GIT_WRITE_SUBCOMMANDS.has(String(args[0] || "")) ? GIT_WRITE_TIMEOUT : GIT_READ_TIMEOUT;
@@ -557,8 +570,21 @@ function gitErrorText(r, args) {
 async function runGit(root, args) {
   await ensureGitResolved();
   const r = await gitExec(root, args);
-  if (!r.ok) lastGitError = { at: Date.now(), command: String(args[0] || ""), text: gitErrorText(r, args) };
-  return { ok: r.ok, output: r.out, error: r.err, timedOut: r.timedOut };
+  const key = gitRootKey(root);
+  if (r.ok) {
+    // Успешный вызов снимает прошлый отказ ТОЙ ЖЕ команды в этой же папке: иначе
+    // «последняя ошибка» висит и после починки. Снимать по любой успешной нельзя —
+    // проверка репозитория (`rev-parse`) проходит и тогда, когда `status` падает, и
+    // стирала бы ровно ту причину, которую показывают настройки.
+    if (lastGitError && lastGitError.root === key && lastGitError.command === String(args[0] || "")) lastGitError = null;
+    return { ok: true, output: r.out, error: r.err, timedOut: r.timedOut };
+  }
+  // Папка без репозитория — обычное состояние свежего проекта (репозиторий
+  // инициализируют из панели изменений), а не отказ git: в настройках это
+  // читалось как «git сломался» и перебивало работающие диффы.
+  const notRepo = isNotRepoError(r.err);
+  if (!notRepo) lastGitError = { root: key, at: Date.now(), command: String(args[0] || ""), text: gitErrorText(r, args) };
+  return { ok: false, output: r.out, error: r.err, timedOut: r.timedOut, notRepo };
 }
 
 function readBody(req) {
@@ -1201,12 +1227,25 @@ async function handleGitInfo(root, url, res) {
   const git = await resolveGit(gitConfig, { fresh });
   let repo = "";
   let repoError = "";
+  let notRepo = false;
   if (git.found) {
     const r = await runGit(root, ["rev-parse", "--show-toplevel"]);
     repo = r.ok ? r.output.trim() : "";
-    repoError = r.ok ? "" : (r.error || "");
+    // Отсутствие репозитория — состояние папки, а не отказ git: интерфейс говорит
+    // «репозитория нет» и предлагает инициализацию, вместо красной строки ошибки.
+    notRepo = !r.ok && r.notRepo === true;
+    repoError = r.ok || notRepo ? "" : (r.error || "");
   }
-  json(res, 200, { ok: true, root, git, repo, repoError, lastError: lastGitError });
+  const key = gitRootKey(root);
+  json(res, 200, {
+    ok: true,
+    root,
+    git,
+    repo,
+    repoError,
+    notRepo,
+    lastError: lastGitError && lastGitError.root === key ? lastGitError : null,
+  });
 }
 
 // Папка проекта без репозитория — обычное состояние свежего проекта: git привозит установщик,
