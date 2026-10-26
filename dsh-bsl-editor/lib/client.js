@@ -999,6 +999,11 @@ window.__ModuleLoader__.load({
             + ".bsl-commit-msg{box-sizing:border-box;width:100%;min-height:54px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-1,#1b1d22);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family,inherit);font-size:13px;line-height:1.4}"
             + ".bsl-commit-error{font-size:12px;color:#f44336}"
             + ".bsl-commit-note{font-size:12px;color:var(--dsw-alias-label-secondary,#8a94a6)}"
+            // Иконки метаданных нарисованы светлыми глифами (#F0EFF1 на #656565):
+            // на тёмном фоне читаются, на светлом сливаются с ним. Инверсия
+            // яркости держит их контраст (#313131 на #929292) и не трогает
+            // тёмную тему.
+            + "body:not([data-ds-dark-theme]) .bsl-meta-icon{filter:invert(.85)}"
             + ".dm-float,.dm-float-panel{top:84px!important}"
             // Подсказка редактора: тонкой полоской сверху, под полосой вкладок, и
             // сама гаснет (NOTICE_MS). По центру поверх кода она закрывала ровно ту
@@ -3185,8 +3190,12 @@ window.__ModuleLoader__.load({
       };
 
       // 1C metadata icons come from the host's /bsl/icons route (dark set).
+      // Their glyphs are near-white (#F0EFF1 on #656565), so they read only on a
+      // dark surface; the .bsl-meta-icon rule below inverts their brightness for
+      // the light theme.
       const metaIcon = (name) => jsx("img", {
         src: "/bsl/icons/" + (name || "common") + ".svg",
+        className: "bsl-meta-icon",
         width: 16, height: 16,
         style: { flexShrink: 0, display: "block" },
         alt: "",
