@@ -271,7 +271,7 @@ async function handleSearch(root, url, res) {
       const st = await new Promise((resolve, reject) => {
         // Мок-res под реальный хелпер json() (writeHead/end).
         handleGitStatus(root, { writeHead: () => {}, end: (b) => resolve(JSON.parse(b)) }, null).catch(reject);
-        setTimeout(() => reject(new Error("git status timeout")), 5000);
+        setTimeout(() => reject(new Error("git status timeout")), 30000);
       });
       changedSet = new Set((st?.files || []).map((f) => String(f.path || "").replace(/\\/g, "/").replace(/\/+$/, "")));
     } catch { changedSet = new Set(); }
@@ -394,9 +394,11 @@ async function handleStat(root, url, res) {
 // кладёт свой git (MinGit) → PATH → типовые места установки Git for Windows.
 // Найденный путь кэшируем на минуту: git на ходу не переезжает, а spawn на
 // каждый показ диффа — лишние процессы.
-// Раскладки, в которых встречается git.exe: MinGit кладёт cmd/git.exe,
-// сборки на msys2 — mingw64/ или ucrt64/bin, портативные — в корень.
-const GIT_BIN_RELATIVE = ["cmd/git.exe", "bin/git.exe", "mingw64/bin/git.exe", "ucrt64/bin/git.exe", "git.exe"];
+// Раскладки, в которых встречается git.exe. ВНУТРЕННИЙ бинарник идёт первым:
+// cmd/git.exe — обёртка, которая запускает его же вторым процессом, и в
+// диспетчере задач один вызов выглядит как две строки «Git for Windows».
+// Сборки на msys2 кладут настоящий git в ucrt64/bin или mingw64/bin.
+const GIT_BIN_RELATIVE = ["ucrt64/bin/git.exe", "mingw64/bin/git.exe", "bin/git.exe", "cmd/git.exe", "git.exe"];
 let gitBin = "git";
 let gitConfig = null;
 let gitResolveCache = { key: "", at: 0, info: null };
@@ -414,16 +416,21 @@ function gitInstallDirs() {
   ];
 }
 
-function probeGitExe(exe) {
-  const r = spawnSync(exe, ["--version"], { windowsHide: true, encoding: "utf-8", timeout: 10000 });
-  if (r.error || r.status !== 0) return "";
-  return String(r.stdout || "").trim();
+// Версия проверяется ТОЙ ЖЕ очередью, что и остальные вызовы: иначе
+// `git --version` работает одновременно со статусом, и в диспетчере задач
+// на секунду видно два процесса вместо одного.
+async function probeGitExe(exe) {
+  const r = await gitQueuedRun(exe, ["--version"], 10_000);
+  return r.ok ? String(r.out || "").trim() : "";
 }
 
-function resolveGit(config, opts = {}) {
+async function resolveGit(config, opts = {}) {
   const explicitPath = String(config?.gitPath || "").trim();
   const key = explicitPath + "|" + (process.env.DSH_HOME || "");
-  if (!opts.fresh && gitResolveCache.info && gitResolveCache.key === key && Date.now() - gitResolveCache.at < 60_000) {
+  // Найденный путь держим минуту, «не найден» — пять секунд: git могли поставить
+  // или он оказался недоступен на мгновение, и минута молчания тут дороже.
+  const ttl = gitResolveCache.info?.found ? 60_000 : 5_000;
+  if (!opts.fresh && gitResolveCache.info && gitResolveCache.key === key && Date.now() - gitResolveCache.at < ttl) {
     gitBin = gitResolveCache.info.found ? gitResolveCache.info.path : "git";
     return gitResolveCache.info;
   }
@@ -435,7 +442,7 @@ function resolveGit(config, opts = {}) {
   };
   if (explicitPath) {
     tried.push(explicitPath);
-    const v = probeGitExe(explicitPath);
+    const v = await probeGitExe(explicitPath);
     if (v) return remember({ found: true, path: explicitPath, version: v, source: "путь из настроек", tried });
   }
   for (const { dir, source } of gitInstallDirs()) {
@@ -443,25 +450,115 @@ function resolveGit(config, opts = {}) {
       const exe = join(dir, rel);
       if (!existsSync(exe)) continue;
       tried.push(exe);
-      const v = probeGitExe(exe);
+      const v = await probeGitExe(exe);
       if (v) return remember({ found: true, path: exe, version: v, source, tried });
     }
   }
   tried.push("git в PATH");
-  const fromPath = probeGitExe("git");
+  const fromPath = await probeGitExe("git");
   if (fromPath) return remember({ found: true, path: "git", version: fromPath, source: "PATH", tried });
   return remember({ found: false, path: "", version: "", source: "", tried });
 }
 
-function ensureGitResolved() {
-  if (gitConfig && !gitResolveCache.info) resolveGit(gitConfig);
+async function ensureGitResolved() {
+  if (gitConfig && !gitResolveCache.info) await resolveGit(gitConfig);
 }
 
-function runGit(root, args) {
-  ensureGitResolved();
-  const r = spawnSync(gitBin, args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
-  if (r.error || r.status !== 0) return { ok: false, output: "" };
-  return { ok: true, output: r.stdout ?? "" };
+// --- git: один процесс за раз ----------------------------------------------
+// Клиент зовёт статус, дифф, отметки и «Изменённые» почти одновременно, а git на
+// большой выгрузке 1С работает секунды. Без очереди каждый запрос порождает свой
+// git.exe, и на машине копятся десятки процессов. Очередь держит ОДИН процесс за
+// раз, одинаковые запросы в полёте склеиваются (все получают тот же ответ), а по
+// таймауту убивается всё дерево процессов: kill одного процесса оставляет внуков
+// git работать.
+const GIT_READ_TIMEOUT = 60_000;
+const GIT_WRITE_TIMEOUT = 900_000; // add/commit на большой выгрузке — это минуты
+const GIT_WRITE_SUBCOMMANDS = new Set(["add", "commit", "init", "apply", "checkout", "reset"]);
+
+// Последняя ошибка git: своя формулировка («git status не отработал») ничего не
+// объясняет, а настройки показывают ровно то, что сказал git.
+let lastGitError = null;
+
+function gitTimeoutFor(args) {
+  return GIT_WRITE_SUBCOMMANDS.has(String(args[0] || "")) ? GIT_WRITE_TIMEOUT : GIT_READ_TIMEOUT;
+}
+
+function gitKillTree(pid) {
+  if (!pid) return;
+  try {
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  } catch {}
+}
+
+function gitRunOnce(bin, root, args, timeout) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin, args, { cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      resolve({ ok: false, out: "", err: String(e?.message || e), code: null, timedOut: false, timeout });
+      return;
+    }
+    const out = [];
+    const err = [];
+    let timedOut = false;
+    child.stdout?.on("data", (c) => out.push(c));
+    child.stderr?.on("data", (c) => err.push(c));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      gitKillTree(child.pid);
+    }, timeout);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, out: "", err: String(e?.message || e), code: null, timedOut, timeout });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0 && !timedOut,
+        out: Buffer.concat(out).toString("utf-8"),
+        err: Buffer.concat(err).toString("utf-8").trim(),
+        code,
+        timedOut,
+        timeout,
+      });
+    });
+  });
+}
+
+let gitChain = Promise.resolve();
+const gitInflight = new Map();
+
+// Один git за раз на плагин: следующий вызов ждёт окончания предыдущего.
+function gitQueuedRun(bin, args, timeout, cwd) {
+  const job = gitChain.then(() => gitRunOnce(bin, cwd, args, timeout));
+  gitChain = job.then(() => {}, () => {});
+  return job;
+}
+
+function gitExec(root, args) {
+  const timeout = gitTimeoutFor(args);
+  const key = [root, timeout, ...args].join("\u0000");
+  const running = gitInflight.get(key);
+  if (running) return running;
+  const job = gitQueuedRun(gitBin, args, timeout, root);
+  gitInflight.set(key, job);
+  job.then(() => { if (gitInflight.get(key) === job) gitInflight.delete(key); });
+  return job;
+}
+
+function gitErrorText(r, args) {
+  const first = String(r.err || "").split("\n").map((line) => line.trim()).find(Boolean);
+  if (first) return first.slice(0, 400);
+  if (r.timedOut) return `git ${args[0] || ""} не ответил за ${Math.round((r.timeout || 0) / 1000)} с — папка слишком большая или её держит другой процесс`;
+  return `git ${args[0] || ""} завершился с кодом ${r.code ?? "?"}`;
+}
+
+async function runGit(root, args) {
+  await ensureGitResolved();
+  const r = await gitExec(root, args);
+  if (!r.ok) lastGitError = { at: Date.now(), command: String(args[0] || ""), text: gitErrorText(r, args) };
+  return { ok: r.ok, output: r.out, error: r.err, timedOut: r.timedOut };
 }
 
 function readBody(req) {
@@ -525,7 +622,7 @@ async function handleGitStatus(root, res, opts) {
   // fresh=1 — явное обновление из интерфейса (кнопка «Обновить дерево»):
   // кэш не читаем, иначе на экране остаются статусы пятисекундной давности.
   const fresh = opts === true || (opts !== null && typeof opts === "object" && opts.fresh === true);
-  const git = resolveGit(gitConfig, { fresh });
+  const git = await resolveGit(gitConfig, { fresh });
   // Без git показывать нечего — и молчать об этом нельзя: пустой список
   // изменений читается как «изменений нет», хотя причина другая.
   if (!git.found) return json(res, 200, { ok: false, files: [], git, reason: "no-git" });
@@ -536,10 +633,17 @@ async function handleGitStatus(root, res, opts) {
   }
   // Новые файлы показываем всегда: --untracked-files=all перечисляет их
   // поштучно вместо свёртки каталога в одну строку "?? dir/".
-  const r = runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+  const r = await runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
   if (!r.ok) {
-    const repo = runGit(root, ["rev-parse", "--show-toplevel"]);
-    return json(res, 200, { ok: false, files: [], git, reason: repo.ok ? "status-failed" : "no-repo" });
+    // Причину называет сам git: «не отработал» без его слов не объясняет ничего.
+    const repo = await runGit(root, ["rev-parse", "--show-toplevel"]);
+    return json(res, 200, {
+      ok: false,
+      files: [],
+      git,
+      reason: repo.ok ? "status-failed" : "no-repo",
+      detail: r.error || "",
+    });
   }
   const files = [];
   const parts = r.output.split("\0");
@@ -582,10 +686,10 @@ function splitDiffHunks(diff) {
 }
 
 // Тот же runGit, но с stderr: причина отказа git apply иначе не видна.
-function runGitErr(root, args) {
-  ensureGitResolved();
-  const r = spawnSync(gitBin, args, { cwd: root, windowsHide: true, encoding: "utf-8", timeout: 20000 });
-  return { ok: !r.error && r.status === 0, out: r.stdout ?? "", err: String(r.stderr ?? "").trim() };
+async function runGitErr(root, args) {
+  await ensureGitResolved();
+  const r = await gitExec(root, args);
+  return { ok: r.ok, out: r.out, err: r.ok ? "" : gitErrorText(r, args) };
 }
 
 // Дифф берём БЕЗ строк контекста (-U0). С обычными тремя строками git склеивает
@@ -617,8 +721,8 @@ async function handleGitDiff(root, url, res) {
   const abs = await resolveInside(root, path).catch(() => "");
   if (!abs) return json(res, 400, { error: "bad path" });
   const rel = relative(root, abs);
-  const work = runGit(root, ["diff", ...DIFF_ARGS, "--", rel]);
-  const cached = runGit(root, ["diff", ...DIFF_ARGS, "--cached", "--", rel]);
+  const work = await runGit(root, ["diff", ...DIFF_ARGS, "--", rel]);
+  const cached = await runGit(root, ["diff", ...DIFF_ARGS, "--cached", "--", rel]);
   // Изменение из индекса откатывается иначе, чем изменение рабочей копии
   // (см. handleRevertHunk), поэтому два diff'а отдаются раздельно — по «diff»
   // клиент их не различил бы.
@@ -641,7 +745,7 @@ async function handleRevertHunk(root, req, res) {
     const rel = relative(root, abs);
     const source = body.source === "index" ? "index" : "worktree";
     const index = Number(body.index);
-    const diff = runGit(root, ["diff", ...DIFF_ARGS, ...(source === "index" ? ["--cached"] : []), "--", rel]);
+    const diff = await runGit(root, ["diff", ...DIFF_ARGS, ...(source === "index" ? ["--cached"] : []), "--", rel]);
     if (!diff.ok) return json(res, 400, { ok: false, error: "git diff не отработал" });
     const { header, hunks } = splitDiffHunks(diff.output);
     if (!Number.isInteger(index) || index < 0 || index >= hunks.length) {
@@ -658,7 +762,7 @@ async function handleRevertHunk(root, req, res) {
     const args = ["apply", "-R", "--unidiff-zero", "--whitespace=nowarn"];
     if (source === "index") args.push("--index");
     args.push(patchFile);
-    const applied = runGitErr(root, args);
+    const applied = await runGitErr(root, args);
     if (!applied.ok) return json(res, 400, { ok: false, error: applied.err || "git apply -R не прошёл" });
     gitStatusCache.delete(root);
     json(res, 200, { ok: true, index, source });
@@ -675,7 +779,7 @@ async function handleRevertFile(root, req, res) {
     const body = JSON.parse(await readBody(req));
     const abs = await resolveInside(root, String(body.path || ""));
     const rel = relative(root, abs).replace(/\\/g, "/");
-    const r = runGitErr(root, ["checkout", "HEAD", "--", rel]);
+    const r = await runGitErr(root, ["checkout", "HEAD", "--", rel]);
     if (!r.ok) return json(res, 400, { ok: false, error: r.err || "git checkout не прошёл" });
     gitStatusCache.delete(root);
     json(res, 200, { ok: true, path: rel });
@@ -706,9 +810,9 @@ function hunkKeysOf(lines) {
 
 // Изменения файла прямо сейчас: рабочая копия и индекс. По ним опознаётся, что
 // ещё живо, а что уже ушло из файла (в коммит или под чужую правку).
-function changeIndex(root, rel) {
-  const workDiff = splitDiffHunks(runGit(root, ["diff", ...DIFF_ARGS, "--", rel]).output || "");
-  const idxDiff = splitDiffHunks(runGit(root, ["diff", "--cached", ...DIFF_ARGS, "--", rel]).output || "");
+async function changeIndex(root, rel) {
+  const workDiff = splitDiffHunks((await runGit(root, ["diff", ...DIFF_ARGS, "--", rel])).output || "");
+  const idxDiff = splitDiffHunks((await runGit(root, ["diff", "--cached", ...DIFF_ARGS, "--", rel])).output || "");
   const keys = new Set();
   const texts = new Set();
   for (const lines of [...workDiff.hunks, ...idxDiff.hunks]) {
@@ -731,17 +835,17 @@ function markInFile(idx, m) {
 // кто-то правил после просмотра. Отметки прежних сборок (без отпечатка и текста)
 // оставляем — сверить их нечем, а лишними на экране они не бывают: правки под них
 // в файле уже нет, и клиент уберёт их сам при первой же записи.
-function pruneReviewed(root, rel) {
+async function pruneReviewed(root, rel) {
   const store = loadReviewed();
   const forRoot = store[root] && store[root][rel] ? store[root] : null;
   if (!forRoot) return [];
   const entry = forRoot[rel];
-  const idx = changeIndex(root, rel);
+  const idx = await changeIndex(root, rel);
   const live = (Array.isArray(entry.marks) ? entry.marks : []).filter((m) => {
     const known = (typeof m.fp === "string" && m.fp) || (typeof m.text === "string" && m.text);
     return known ? markInFile(idx, m) : true;
   });
-  if (live.length) forRoot[rel] = { headSha: headOf(root), marks: live, hashes: live.map((m) => m.id) };
+  if (live.length) forRoot[rel] = { headSha: await headOf(root), marks: live, hashes: live.map((m) => m.id) };
   else delete forRoot[rel];
   if (!Object.keys(forRoot).length) delete store[root];
   mkdirSync(LOG_DIR, { recursive: true });
@@ -749,7 +853,7 @@ function pruneReviewed(root, rel) {
   return live;
 }
 async function handleReviewed(root, req, url, res) {
-  const head = runGit(root, ["rev-parse", "HEAD"]);
+  const head = await runGit(root, ["rev-parse", "HEAD"]);
   const headSha = head.ok ? head.output.trim() : "";
   if (req.method === "POST") {
     try {
@@ -803,7 +907,7 @@ async function handleReviewed(root, req, url, res) {
       ? []
       : entry.headSha === headSha
         ? (Array.isArray(entry.marks) ? entry.marks : [])
-        : pruneReviewed(root, rel);
+        : await pruneReviewed(root, rel);
     json(res, 200, { ok: true, headSha, hashes: marks.map((m) => m.id) });
   } catch (e) {
     json(res, 400, { ok: false, error: e?.message || String(e) });
@@ -812,23 +916,23 @@ async function handleReviewed(root, req, url, res) {
 
 // --- Индексация просмотренного и коммит ------------------------------------
 
-function headOf(root) {
-  const h = runGit(root, ["rev-parse", "HEAD"]);
+async function headOf(root) {
+  const h = await runGit(root, ["rev-parse", "HEAD"]);
   return h.ok ? h.output.trim() : "";
 }
 
 // Новый файл (??) — его в индексе видно целиком: базы для diff'а у него нет.
-function isUntracked(root, rel) {
-  const st = runGit(root, ["status", "--porcelain", "--", rel]);
+async function isUntracked(root, rel) {
+  const st = await runGit(root, ["status", "--porcelain", "--", rel]);
   return st.ok && String(st.output).trim().startsWith("??");
 }
 
-function reviewedMarks(root, rel, headSha) {
+async function reviewedMarks(root, rel, headSha) {
   const entry = loadReviewed()[root]?.[rel];
   if (!entry) return [];
   // Отметки живут по изменениям, а не по ревизии: после коммита отмечать заново
   // нужно только то, что в индекс не попало, — остальное человек уже посмотрел.
-  return entry.headSha === headSha ? (Array.isArray(entry.marks) ? entry.marks : []) : pruneReviewed(root, rel);
+  return entry.headSha === headSha ? (Array.isArray(entry.marks) ? entry.marks : []) : await pruneReviewed(root, rel);
 }
 
 // Отправить в индекс ПРОСМОТРЕННЫЕ изменения одного файла: остальные строки файла
@@ -843,14 +947,14 @@ function reviewedMarks(root, rel, headSha) {
 // человек читал «файл менялся после просмотра» там, где файл не менялся.
 async function stageOneFile(root, rel) {
   try {
-    if (isUntracked(root, rel)) {
-      const add = runGitErr(root, ["add", "--", rel]);
+    if (await isUntracked(root, rel)) {
+      const add = await runGitErr(root, ["add", "--", rel]);
       if (!add.ok) return { error: add.err || "git add не прошёл" };
       return { untracked: true, staged: 1, skipped: 0, inIndex: 0 };
     }
-    const marks = reviewedMarks(root, rel, headOf(root));
+    const marks = await reviewedMarks(root, rel, await headOf(root));
     if (!marks.length) return { staged: 0, skipped: 0, inIndex: 0, reason: "no-marks", marks: 0, hunks: 0 };
-    const { workDiff, idxDiff, keys: knownKeys, texts: knownTexts } = changeIndex(root, rel);
+    const { workDiff, idxDiff, keys: knownKeys, texts: knownTexts } = await changeIndex(root, rel);
     const markFp = new Set(marks.filter((m) => typeof m.fp === "string" && m.fp).map((m) => m.fp));
     const byText = new Set(marks.filter((m) => typeof m.text === "string" && m.text).map((m) => m.text));
     const matches = (lines) => hunkKeysOf(lines).some((k) => markFp.has(k)) || byText.has(lines.join("\n"));
@@ -881,7 +985,7 @@ async function stageOneFile(root, rel) {
     mkdirSync(LOG_DIR, { recursive: true });
     const patchFile = join(LOG_DIR, "stage.patch");
     writeFileSync(patchFile, workDiff.header + picked.map((t) => t + "\n").join(""), "utf-8");
-    const applied = runGitErr(root, ["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", patchFile]);
+    const applied = await runGitErr(root, ["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", patchFile]);
     if (!applied.ok) return { error: applied.err || "git apply --cached не прошёл" };
     return {
       staged: picked.length,
@@ -923,15 +1027,16 @@ async function handleStage(root, req, res) {
 // сюда не попадают: у них отметок нет, индексируются кнопкой в своей вкладке.
 async function handleStageAll(root, res) {
   try {
-    const st = runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
-    if (!st.ok) return json(res, 400, { ok: false, error: "git status не отработал" });
+    const st = await runGit(root, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+    if (!st.ok) return json(res, 400, { ok: false, error: st.error || "git status не отработал" });
     // В -z каждая запись — «XY путь»; у переименований следом идёт поле без
     // статуса, поэтому берём только строки с настоящим статусом.
-    const rels = String(st.output)
-      .split("\0")
-      .filter((e) => /^[ MADRCU?!]{2} /.test(e))
-      .map((e) => e.slice(3))
-      .filter((rel) => rel && !isUntracked(root, rel));
+    const rels = [];
+    for (const entry of String(st.output).split("\0")) {
+      if (!/^[ MADRCU?!]{2} /.test(entry)) continue;
+      const rel = entry.slice(3);
+      if (rel && !(await isUntracked(root, rel))) rels.push(rel);
+    }
     let staged = 0;
     let skipped = 0;
     let noMarks = 0;
@@ -958,22 +1063,26 @@ async function handleStageAll(root, res) {
 }
 
 // Что лежит в индексе — для окна коммита.
-function handleStaged(root, res) {
-  const num = runGit(root, ["diff", "--cached", "--numstat"]);
-  const files = [];
-  if (num.ok) {
+async function handleStaged(root, res) {
+  try {
+    const num = await runGit(root, ["diff", "--cached", "--numstat"]);
+    const files = [];
+    if (num.ok) {
     for (const line of String(num.output).split("\n")) {
       if (!line.trim()) continue;
       const parts = line.split("\t");
       if (parts.length < 3) continue;
-      files.push({
-        path: parts.slice(2).join("\t"),
-        added: parts[0] === "-" ? 0 : Number(parts[0]) || 0,
-        removed: parts[1] === "-" ? 0 : Number(parts[1]) || 0,
-      });
+        files.push({
+          path: parts.slice(2).join("\t"),
+          added: parts[0] === "-" ? 0 : Number(parts[0]) || 0,
+          removed: parts[1] === "-" ? 0 : Number(parts[1]) || 0,
+        });
+      }
     }
+    json(res, 200, { ok: true, files });
+  } catch (e) {
+    json(res, 400, { ok: false, error: e?.message || String(e) });
   }
-  json(res, 200, { ok: true, files });
 }
 
 // Коммит индекса. Сообщение приходит от человека: своего текста мы не
@@ -983,10 +1092,10 @@ async function handleCommit(root, req, res) {
     const body = JSON.parse(await readBody(req));
     const message = String(body.message || "").replace(/\r\n/g, "\n").trim();
     if (!message) return json(res, 400, { ok: false, error: "нужно сообщение коммита" });
-    const idx = runGit(root, ["diff", "--cached", "--name-only"]);
+    const idx = await runGit(root, ["diff", "--cached", "--name-only"]);
     const files = idx.ok ? String(idx.output).split("\n").filter(Boolean) : [];
     if (!files.length) return json(res, 400, { ok: false, error: "в индексе ничего нет" });
-    const r = runGitErr(root, ["commit", "-m", message]);
+    const r = await runGitErr(root, ["commit", "-m", message]);
     if (!r.ok) return json(res, 400, { ok: false, error: r.err || "git commit не прошёл" });
     gitStatusCache.delete(root);
     json(res, 200, { ok: true, files: files.length, summary: String(r.out).split("\n")[0] || "" });
@@ -1058,7 +1167,7 @@ async function handleMetaList(root, url, res) {
     if (url.searchParams.get("changed")) {
       const st = await new Promise((resolve, reject) => {
         handleGitStatus(root, { writeHead: () => {}, end: (b) => resolve(JSON.parse(b)) }, null).catch(reject);
-        setTimeout(() => reject(new Error("git status timeout")), 5000);
+        setTimeout(() => reject(new Error("git status timeout")), 30000);
       });
       // config здесь недоступен (handleMetaList не получает его) — кэш
       // git-status заполняется полным (untracked-включающим) вариантом из
@@ -1089,13 +1198,15 @@ async function handleMetaSearch(root, url, res) {
 // должен видеть причину, а не пустой список изменений.
 async function handleGitInfo(root, url, res) {
   const fresh = url.searchParams.get("fresh") === "1";
-  const git = resolveGit(gitConfig, { fresh });
+  const git = await resolveGit(gitConfig, { fresh });
   let repo = "";
+  let repoError = "";
   if (git.found) {
-    const r = runGit(root, ["rev-parse", "--show-toplevel"]);
+    const r = await runGit(root, ["rev-parse", "--show-toplevel"]);
     repo = r.ok ? r.output.trim() : "";
+    repoError = r.ok ? "" : (r.error || "");
   }
-  json(res, 200, { ok: true, root, git, repo });
+  json(res, 200, { ok: true, root, git, repo, repoError, lastError: lastGitError });
 }
 
 // Папка проекта без репозитория — обычное состояние свежего проекта: git привозит установщик,
@@ -1103,36 +1214,41 @@ async function handleGitInfo(root, url, res) {
 // это действие: init, локальная подпись, .gitignore и первый коммит, чтобы изменениям было от
 // чего считаться.
 async function handleGitInit(root, _req, res) {
-  const git = resolveGit(gitConfig, { fresh: true });
+  const git = await resolveGit(gitConfig, { fresh: true });
   if (!git.found) {
     json(res, 400, { ok: false, error: "git не найден: укажите путь к git.exe в настройках «1С-Редактор кода»" });
     return;
   }
-  const existing = runGit(root, ["rev-parse", "--show-toplevel"]);
+  const existing = await runGit(root, ["rev-parse", "--show-toplevel"]);
   if (existing.ok) {
     json(res, 200, { ok: true, repo: existing.output.trim(), already: true });
     return;
   }
-  const init = runGit(root, ["init", "-b", "main"]);
+  const init = await runGit(root, ["init", "-b", "main"]);
   // Git старше 2.28 не знает -b; тогда ветка останется той, что задана по умолчанию.
-  if (!init.ok && !runGit(root, ["init"]).ok) {
-    json(res, 500, { ok: false, error: "git init не отработал: " + String(init.output || "").slice(-300) });
-    return;
+  if (!init.ok) {
+    const retry = await runGit(root, ["init"]);
+    if (!retry.ok) {
+      json(res, 500, { ok: false, error: "git init не отработал: " + (init.error || retry.error || "") });
+      return;
+    }
   }
   // Коммит без подписи git отвергнет: в свежей системе user.name/user.email не заданы.
   // Правим только локальный конфиг репозитория, глобальный не трогаем.
-  if (!runGit(root, ["config", "user.name"]).output.trim()) runGit(root, ["config", "user.name", "DSH для 1С"]);
-  if (!runGit(root, ["config", "user.email"]).output.trim()) runGit(root, ["config", "user.email", "dsh-1c@local"]);
+  if (!(await runGit(root, ["config", "user.name"])).output.trim()) await runGit(root, ["config", "user.name", "DSH для 1С"]);
+  if (!(await runGit(root, ["config", "user.email"])).output.trim()) await runGit(root, ["config", "user.email", "dsh-1c@local"]);
   // .dsh хранит путь к базе; *.cfl — служебные файлы блокировки 1С, в истории им делать нечего.
   const ignoreFile = join(root, ".gitignore");
   if (!existsSync(ignoreFile)) writeFileSync(ignoreFile, [".dsh/", "*.cfl", "*.log", ""].join("\n"), "utf8");
-  runGit(root, ["add", "-A"]);
-  const commit = runGit(root, ["commit", "-m", "Первый коммит: исходное состояние проекта"]);
+  // Индексация всей выгрузки 1С — это минуты: раннер даёт записи 15 минут и не
+  // убивает git по дороге, поэтому первый коммит доходит до конца.
+  const add = await runGit(root, ["add", "-A"]);
+  const commit = await runGit(root, ["commit", "-m", "Первый коммит: исходное состояние проекта"]);
   json(res, 200, {
     ok: true,
     repo: root,
     committed: commit.ok,
-    detail: commit.ok ? "" : String(commit.output || "").slice(-300),
+    detail: commit.ok ? "" : (commit.error || add.error || ""),
   });
 }
 
@@ -1145,7 +1261,7 @@ async function handleRefreshAll(root, _req, res) {
   metaModel = null;
   // git могли поставить, пока приложение работало.
   gitResolveCache = { key: "", at: 0, info: null };
-  resolveGit(gitConfig, { fresh: true });
+  await resolveGit(gitConfig, { fresh: true });
   json(res, 200, { ok: true });
 }
 
@@ -1270,7 +1386,9 @@ export function apply(ctx, config) {
   // git ищем один раз на старте: настройки плагина доступны только здесь, а
   // runGit зовётся из десятка мест и не должен каждый раз ходить по диску.
   gitConfig = config;
-  resolveGit(config);
+  // Резолвер асинхронный (проверка версии идёт через общую очередь git): здесь
+  // только запускаем его, ждать в apply() незачем.
+  resolveGit(config).catch(() => {});
 
   // Warm the filename index in the background so the first search is instant.
   ensureIndex(root).catch(() => {});

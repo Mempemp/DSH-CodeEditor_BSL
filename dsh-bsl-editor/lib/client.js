@@ -787,6 +787,7 @@ window.__ModuleLoader__.load({
       // Без этого пустой список читается как «изменений нет», хотя git может
       // быть просто не найден.
       const [gitWhy, setGitWhy] = useState("");
+      const [gitDetail, setGitDetail] = useState(""); // что сказал сам git
       const [gitInitBusy, setGitInitBusy] = useState(false);
       const [gitInitError, setGitInitError] = useState("");
       const [rootTitle, setRootTitle] = useState("");
@@ -1297,6 +1298,7 @@ window.__ModuleLoader__.load({
           // сбрасывается, иначе список изменённых пятисекундной давности.
           const data = await fetchJson("/bsl/git-status" + (fresh ? "?fresh=1" : ""));
           setGitWhy(data.ok ? "" : String(data.reason || ""));
+          setGitDetail(data.ok ? "" : String(data.detail || ""));
           if (data.ok) {
             const m = new Map();
             for (const f of data.files) m.set(f.path, f.status);
@@ -3144,7 +3146,7 @@ window.__ModuleLoader__.load({
               }),
             ]})
           : gitWhy === "status-failed"
-          ? "git status не отработал — подробности в панели «1С-Редактор кода» настроек"
+          ? "git status не отработал: " + (gitDetail || "причина не сообщена")
           : "Нет изменённых файлов";
       const renderGitList = () => {
         if (!gitFiles.size) {
@@ -3594,7 +3596,11 @@ window.__ModuleLoader__.load({
       const [gitBusy, setGitBusy] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
-        fetchJson("/bsl/git-info").then((d) => { if (alive) setGitInfo(d); }).catch(() => {});
+        // fresh=1 на первом показе: экран не должен показывать «не найден» из-за
+        // ответа, снятого до того, как приложение подняло окружение.
+        fetchJson("/bsl/git-info?fresh=1")
+          .then((d) => { if (alive) setGitInfo(d); })
+          .catch((e) => { if (alive) setGitInfo({ ok: false, error: String(e?.message || e) }); });
         return () => { alive = false; };
       }, []);
       // Кнопка и сохраняет путь, и проверяет его же — иначе значение на экране
@@ -3658,12 +3664,27 @@ window.__ModuleLoader__.load({
         // git.exe лежит не там, где мы ищем, человек указывает его здесь.
         jsxs("div", { style: { borderTop: "1px solid var(--dsw-alias-border-l2)", marginTop: 2, paddingTop: 10, display: "flex", flexDirection: "column", gap: 8 }, children: [
           jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8 }, children: [
-            jsx("span", { children: "Git — " + (gitInfo?.git?.found ? "найден" : "не найден") }),
+            // Пока ответа нет, состояние НЕИЗВЕСТНО: писать «не найден» нельзя —
+            // именно это читалось как «git пропал, пока не нажмёшь Проверить снова».
+            jsx("span", { children: "Git — " + (gitInfo == null
+              ? "проверяем…"
+              : gitInfo.ok === false
+                ? "проверить не удалось"
+                : gitInfo.git?.found ? "найден" : "не найден") }),
             gitInfo?.git?.found ? jsx("span", { style: { opacity: 0.55, fontSize: 11 }, children: gitInfo.git.version }) : null,
           ]}),
+          gitInfo?.ok === false && gitInfo?.error ? jsx("div", { style: { color: "#f48771", fontSize: 11, lineHeight: 1.4, whiteSpace: "pre-wrap" }, children: gitInfo.error }) : null,
           gitInfo?.git?.found
             ? jsx("code", { style: { display: "block", opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: gitInfo.git.source + ": " + (gitInfo.git.path === "git" ? "из PATH" : gitInfo.git.path) })
-            : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
+            : gitInfo == null
+              ? null
+              : jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Без Git не работают диффы, индикаторы изменений и кнопки «В индекс» / «Коммит»." }),
+          gitInfo?.lastError?.text ? jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4, whiteSpace: "pre-wrap", wordBreak: "break-word" }, children: "Последняя ошибка git — " + gitInfo.lastError.text }) : null,
+          // Отдельная подсказка только для одной причины: лок индекса остаётся от
+          // прерванной операции и блокирует всё остальное, а сам git называет файл.
+          gitInfo?.lastError?.text && /index\.lock/i.test(gitInfo.lastError.text)
+            ? jsx("div", { style: { color: "#e2c08d", fontSize: 11, lineHeight: 1.4 }, children: "Файл .git/index.lock остался от прерванной операции. Его можно удалить, если git сейчас ничего не делает." })
+            : null,
           // Репозиторий принадлежит папке проекта, а не редактору вообще: здесь только путь к
           // git.exe. Инициализация — в панели изменений, где открытый проект назван путём.
           jsxs("label", { style: { display: "block" }, children: [
