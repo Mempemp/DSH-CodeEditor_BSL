@@ -8,7 +8,7 @@
 // The browser half loads Monaco from a CDN and talks to the LSP server
 // directly over a native WebSocket.
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, openSync, promises as fs, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, promises as fs, readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { join, relative, normalize, isAbsolute } from "node:path";
@@ -50,10 +50,6 @@ const DEFAULT_BIN = join(
 
 const LOG_DIR = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "dsh-bsl-editor");
 const LOG_FILE = join(LOG_DIR, "server.log");
-// Журнал отказов: причина остаётся на диске, а не только на экране. Без него разбор
-// сводится к пересказу текста ошибки человеком — «вылез HTTP 400» и всё.
-const ERRORS_FILE = join(LOG_DIR, "errors.log");
-const ERRORS_MAX_BYTES = 2 * 1024 * 1024;
 const CONFIG_FILE = join(LOG_DIR, "bsl-language-server.json");
 // User settings saved from the in-tab settings panel (override the defaults).
 const PLUGIN_CONFIG_FILE = join(LOG_DIR, "plugin-config.json");
@@ -190,23 +186,25 @@ async function resolveInside(root, requested) {
   return abs;
 }
 
-// Один отказ — одна строка JSON: время, маршрут, код, причина. Файл растёт
-// ограниченно: перевалил за 2 МБ — уезжает в errors.log.1, старое затирается.
+// Отказы уходят в штатный журнал DSH (ctx.logger, им пользуются и другие плагины):
+// своих файлов не заводим — общая папка не наше место. Нет логгера в контексте —
+// молчим: причина всё равно приходит в ответе и показывается на экране.
+let pluginLog = null;
 let lastFailureKey = "";
 let lastFailureAt = 0;
 
 function logFailure(entry) {
+  if (!pluginLog) return;
+  // Клиент опрашивает статус и метаданные постоянно — одна и та же причина не
+  // должна заливать журнал десятки раз подряд.
+  const key = [entry.route, entry.status, entry.reason, entry.message].join("|");
+  if (key === lastFailureKey && Date.now() - lastFailureAt < 60_000) return;
+  lastFailureKey = key;
+  lastFailureAt = Date.now();
+  const head = [entry.route || "?", entry.status || "?"].join(" → ");
+  const tail = [entry.reason ? "(" + entry.reason + ")" : "", entry.message || ""].filter(Boolean).join(" ");
   try {
-    // Клиент повторяет запросы (статус, метаданные) — одна и та же причина не
-    // должна появляться в журнале десятки раз подряд.
-    const key = [entry.route, entry.status, entry.reason, entry.message].join("|");
-    if (key === lastFailureKey && Date.now() - lastFailureAt < 60_000) return;
-    lastFailureKey = key;
-    lastFailureAt = Date.now();
-    mkdirSync(LOG_DIR, { recursive: true });
-    const st = statSync(ERRORS_FILE, { throwIfNoEntry: false });
-    if (st && st.size > ERRORS_MAX_BYTES) renameSync(ERRORS_FILE, ERRORS_FILE + ".1");
-    appendFileSync(ERRORS_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\r\n");
+    pluginLog.warn("[bsl] " + head + (tail ? ": " + tail : ""));
   } catch {}
 }
 
@@ -1498,6 +1496,9 @@ export function apply(ctx, config) {
   // Warm the filename index in the background so the first search is instant.
   ensureIndex(root).catch(() => {});
 
+  // Штатный журнал DSH: есть в контексте — пишем туда, нет — молчим.
+  pluginLog = ctx.logger && typeof ctx.logger.warn === "function" ? ctx.logger : null;
+
   // Каждый маршрут проходит через обёртку: ответ помечается своим путём, чтобы
   // журнал отказов говорил, какой именно запрос не отработал, а не «что-то упало».
   const reg = (spec) => ctx.webServer.register({
@@ -1575,39 +1576,6 @@ export function apply(ctx, config) {
         json(res, 200, { ok: true, log: tail });
       } catch {
         json(res, 200, { ok: false, log: "(no log yet)" });
-      }
-    },
-  });
-  // Что упало в последний раз. Читаем из журнала, а не из памяти: после
-  // перезапуска причина тоже должна быть на месте.
-  reg({
-    kind: "exact", path: "/bsl/errors",
-    handler: (req, res) => {
-      const want = Number(new URL(req.url, "http://x").searchParams.get("tail") || 20);
-      const n = Math.min(Math.max(Number.isFinite(want) ? want : 20, 1), 200);
-      let lines = [];
-      let exists = false;
-      let total = 0;
-      try {
-        const all = readFileSync(ERRORS_FILE, "utf-8").split(/\r?\n/).filter(Boolean);
-        exists = true;
-        total = all.length;
-        lines = all.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { at: "", message: l }; } });
-      } catch {}
-      json(res, 200, { ok: true, file: ERRORS_FILE, dir: LOG_DIR, exists, total, lines });
-    },
-  });
-  // Показать журнал в проводнике: путь копировать руками человек не должен.
-  reg({
-    kind: "exact", path: "/bsl/open-log-dir",
-    handler: (_req, res) => {
-      try {
-        mkdirSync(LOG_DIR, { recursive: true });
-        const child = spawn("explorer", [LOG_DIR], { detached: true, stdio: "ignore" });
-        child.unref();
-        json(res, 200, { ok: true, dir: LOG_DIR });
-      } catch (e) {
-        json(res, 500, { ok: false, error: e?.message || String(e) });
       }
     },
   });
