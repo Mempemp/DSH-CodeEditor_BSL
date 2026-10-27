@@ -33,6 +33,11 @@ export const Config = z.object({
   interceptChatOpen: z.boolean().default(true),
   /** Explicit path to git.exe; empty = auto-resolve (bundled copy, PATH, Git for Windows). */
   gitPath: z.string().default(""),
+  /**
+   * Предел чтения из git (`status`, `diff`, `rev-parse`), секунды. На большой выгрузке и сетевом
+   * диске `git status` идёт минутами — фиксированные 60 с обрывали его и выглядели как поломка.
+   */
+  gitReadTimeoutSec: z.number().default(300),
 });
 
 // webServer (HTTP routes) + workspaceRegistry (the user's DSH workspaces).
@@ -471,7 +476,12 @@ async function ensureGitResolved() {
 // раз, одинаковые запросы в полёте склеиваются (все получают тот же ответ), а по
 // таймауту убивается всё дерево процессов: kill одного процесса оставляет внуков
 // git работать.
-const GIT_READ_TIMEOUT = 60_000;
+const GIT_READ_TIMEOUT = 300_000;
+// Настройки плагина нужны функции таймаута, а она живёт вне apply(): держим ссылку на конфиг.
+let activeConfig = {};
+// Нижняя граница — чтобы настройка не сделала git заведомо нерабочим.
+const GIT_READ_TIMEOUT_MIN = 10_000;
+const GIT_READ_TIMEOUT_MAX = 3_600_000;
 const GIT_WRITE_TIMEOUT = 900_000; // add/commit на большой выгрузке — это минуты
 const GIT_WRITE_SUBCOMMANDS = new Set(["add", "commit", "init", "apply", "checkout", "reset"]);
 
@@ -493,7 +503,10 @@ function isNotRepoError(text) {
 }
 
 function gitTimeoutFor(args) {
-  return GIT_WRITE_SUBCOMMANDS.has(String(args[0] || "")) ? GIT_WRITE_TIMEOUT : GIT_READ_TIMEOUT;
+  if (GIT_WRITE_SUBCOMMANDS.has(String(args[0] || ""))) return GIT_WRITE_TIMEOUT;
+  const configured = Number(activeConfig?.gitReadTimeoutSec) * 1000;
+  if (!Number.isFinite(configured) || configured <= 0) return GIT_READ_TIMEOUT;
+  return Math.min(Math.max(configured, GIT_READ_TIMEOUT_MIN), GIT_READ_TIMEOUT_MAX);
 }
 
 function gitKillTree(pid) {
@@ -507,7 +520,14 @@ function gitRunOnce(bin, root, args, timeout) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      // GIT_OPTIONAL_LOCKS=0 — `status` не берёт блокировку индекса и не ждёт чужой операции;
+      // GIT_TERMINAL_PROMPT=0 — вместо вопроса о пароле сразу отказ.
+      child = spawn(bin, args, {
+        cwd: root,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+      });
     } catch (e) {
       resolve({ ok: false, out: "", err: String(e?.message || e), code: null, timedOut: false, timeout });
       return;
@@ -563,7 +583,12 @@ function gitExec(root, args) {
 function gitErrorText(r, args) {
   const first = String(r.err || "").split("\n").map((line) => line.trim()).find(Boolean);
   if (first) return first.slice(0, 400);
-  if (r.timedOut) return `git ${args[0] || ""} не ответил за ${Math.round((r.timeout || 0) / 1000)} с — папка слишком большая или её держит другой процесс`;
+  if (r.timedOut) {
+    return (
+      `git ${args[0] || ""} не ответил за ${Math.round((r.timeout || 0) / 1000)} с — папка большая, ` +
+      "сетевой диск или её держит другой процесс. Предел меняется в настройках: «Таймаут чтения git»."
+    );
+  }
   return `git ${args[0] || ""} завершился с кодом ${r.code ?? "?"}`;
 }
 
@@ -1408,6 +1433,7 @@ function handleVendor(_root, url, res) {
 export function apply(ctx, config) {
   // Settings saved from the in-tab panel win over the bundled defaults.
   Object.assign(config, loadPluginOverrides());
+  activeConfig = config;
 
   // The user's project comes from the DSH workspace registry; fall back to dsh
   // cwd only when there is no workspace (never dsh's install dir by accident).
@@ -1511,6 +1537,7 @@ export function apply(ctx, config) {
       workspaceDir: config.workspaceDir,
       sourceExtensions: config.sourceExtensions,
       gitPath: config.gitPath || "",
+      gitReadTimeoutSec: Math.round(gitTimeoutFor(["status"]) / 1000),
     }),
   });
   ctx.webServer.register({
@@ -1528,6 +1555,7 @@ export function apply(ctx, config) {
             serverBin: patch.serverBin ?? config.serverBin,
             sourceExtensions: patch.sourceExtensions ?? config.sourceExtensions,
             gitPath: patch.gitPath ?? config.gitPath ?? "",
+            gitReadTimeoutSec: patch.gitReadTimeoutSec ?? config.gitReadTimeoutSec ?? 300,
           };
           mkdirSync(LOG_DIR, { recursive: true });
           writeFileSync(PLUGIN_CONFIG_FILE, JSON.stringify(next, null, 2) + "\n", "utf-8");

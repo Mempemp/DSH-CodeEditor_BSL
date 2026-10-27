@@ -3594,7 +3594,7 @@ window.__ModuleLoader__.load({
     // single config source is the host (/bsl/config, persisted on save).
     function PluginSettingsSection() {
       const [cfg, setCfg] = React.useState(null);
-      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", interceptChatOpen: true, gitPath: "" });
+      const [form, setForm] = React.useState({ lspEnabled: false, serverPort: 8025, serverBin: "", interceptChatOpen: true, gitPath: "", gitReadTimeoutSec: 300 });
       const [saved, setSaved] = React.useState(false);
       React.useEffect(() => {
         let alive = true;
@@ -3620,7 +3620,7 @@ window.__ModuleLoader__.load({
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ gitPath: form.gitPath }),
+            body: JSON.stringify({ gitPath: form.gitPath, gitReadTimeoutSec: form.gitReadTimeoutSec }),
           });
           const d = await fetchJson("/bsl/git-info?fresh=1");
           setGitInfo(d);
@@ -3631,16 +3631,16 @@ window.__ModuleLoader__.load({
         }
       };
       React.useEffect(() => {
-        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false, gitPath: cfg.gitPath || "" });
+        if (cfg) setForm({ lspEnabled: cfg.lspEnabled !== false, serverPort: cfg.serverPort || 8025, serverBin: cfg.serverBin || "", interceptChatOpen: cfg.interceptChatOpen !== false, gitPath: cfg.gitPath || "", gitReadTimeoutSec: cfg.gitReadTimeoutSec || 300 });
       }, [cfg]);
       const save = async () => {
         try {
           await fetchJson("/bsl/config-save", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath }),
+            body: JSON.stringify({ lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath, gitReadTimeoutSec: Number(form.gitReadTimeoutSec) || 300 }),
           });
-          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath }));
+          setCfg((c) => ({ ...(c || {}), lspEnabled: form.lspEnabled, serverPort: form.serverPort, serverBin: form.serverBin, interceptChatOpen: form.interceptChatOpen, gitPath: form.gitPath, gitReadTimeoutSec: Number(form.gitReadTimeoutSec) || 300 }));
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } catch (e) {
@@ -3703,6 +3703,15 @@ window.__ModuleLoader__.load({
           jsxs("label", { style: { display: "block" }, children: [
             jsx("div", { style: { marginBottom: 4, opacity: 0.7 }, children: "Путь к git.exe" }),
             jsx("input", { type: "text", value: form.gitPath, onChange: (e) => setForm((f) => ({ ...f, gitPath: e.target.value })), placeholder: "(пусто = найти автоматически)", style: inputStyle }),
+            jsx("div", { style: { marginTop: 8, marginBottom: 4, opacity: 0.7 }, children: "Таймаут чтения git, с" }),
+            jsx("input", {
+              type: "number",
+              value: form.gitReadTimeoutSec,
+              onChange: (e) => setForm((f) => ({ ...f, gitReadTimeoutSec: e.target.value })),
+              placeholder: "300",
+              style: inputStyle,
+            }),
+            jsx("div", { style: { opacity: 0.6, fontSize: 11, lineHeight: 1.4 }, children: "Сколько ждать git status и diff. На большой выгрузке и сетевом диске ставьте больше: 600–1800." }),
           ]}),
           jsx("div", { children: jsx("button", { onClick: checkGit, disabled: gitBusy, style: { height: 28, padding: "0 14px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: gitBusy ? "wait" : "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: gitBusy ? "Проверяем…" : "Проверить снова" }) }),
         ]}),
