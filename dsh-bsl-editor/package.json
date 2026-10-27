@@ -1,6 +1,6 @@
 {
   "name": "dsh-bsl-editor",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "1С-Редактор кода для DeepSeek Harness: дерево метаданных конфигурации, Monaco с официальной BSL-грамматикой, переход к определению, индикаторы изменений git, опциональный LSP.",
   "keywords": [
     "dsh",
