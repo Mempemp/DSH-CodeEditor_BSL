@@ -127,9 +127,21 @@ window.__ModuleLoader__.load({
       return m[ext] || "plaintext";
     }
 
+    // Причину называет хост — её надо прочитать и на ошибке: без этого на экране
+    // оставалось голое «HTTP 400», по которому нельзя понять, что случилось
+    // (нет git, папка не выгрузка 1С, файл не текстовый, в индексе пусто).
+    async function errorFromResponse(res) {
+      let body = null;
+      try { body = await res.json(); } catch {}
+      const err = new Error(String((body && (body.error || body.detail)) || ("HTTP " + res.status)));
+      err.status = res.status;
+      err.body = body;
+      return err;
+    }
+
     async function fetchJson(url, opts) {
       const res = await fetch(url, opts);
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) throw await errorFromResponse(res);
       return res.json();
     }
 
@@ -787,11 +799,13 @@ window.__ModuleLoader__.load({
       // Без этого пустой список читается как «изменений нет», хотя git может
       // быть просто не найден.
       const [gitWhy, setGitWhy] = useState("");
+      const [gitLoading, setGitLoading] = useState(false); // читаем список изменений
       const [gitDetail, setGitDetail] = useState(""); // что сказал сам git
       const [gitInitBusy, setGitInitBusy] = useState(false);
       const [gitInitError, setGitInitError] = useState("");
       const [rootTitle, setRootTitle] = useState("");
       const [treeError, setTreeError] = useState("");
+      const [loadingDirs, setLoadingDirs] = useState(() => new Set()); // какие каталоги читаются прямо сейчас
       const [refreshBusy, setRefreshBusy] = useState(false); // идёт «Обновить дерево»
       const [monacoReady, setMonacoReady] = useState(false);
       const [search, setSearch] = useState(editorPersist.search);
@@ -807,6 +821,7 @@ window.__ModuleLoader__.load({
       const [metaExpanded, setMetaExpanded] = useState(() => new Set(editorPersist.metaExpanded)); // expanded nodeKeys
       const [metaInfo, setMetaInfo] = useState(editorPersist.metaInfo); // /bsl/meta/status result
       const [metaError, setMetaError] = useState(editorPersist.metaError);
+      const [metaLoadingKey, setMetaLoadingKey] = useState(null); // какой узел метаданных читается
       const [metaLoading, setMetaLoading] = useState(false);
       const [metaHighlight, setMetaHighlight] = useState(editorPersist.metaHighlight);
       const [editorNotice, setEditorNotice] = useState(null); // transient banner over the editor
@@ -987,6 +1002,12 @@ window.__ModuleLoader__.load({
             + ".bsl-hunk-btn--accept:hover{background:rgba(46,160,67,.18);border-color:rgba(46,160,67,.55);color:#7ee2a8}"
             + ".bsl-hunk-btn--armed{background:rgba(248,81,73,.22)!important;border-color:rgba(248,81,73,.6)!important;color:#f88f8a!important}"
             + ".bsl-git-flash{animation:bsl-git-flash-kf .6s ease-out}@keyframes bsl-git-flash-kf{from{background:rgba(255,220,90,.35)}to{background:transparent}}"
+            // Ожидание чтения: на большой выгрузке папка открывается секундами,
+            // и без индикатора клик выглядел как «ничего не произошло».
+            + "@keyframes bsl-spin-kf{to{transform:rotate(360deg)}}"
+            + ".bsl-spin{animation:bsl-spin-kf .8s linear infinite}"
+            + ".bsl-spinner{display:inline-block;flex-shrink:0;border-radius:50%;border:2px solid currentColor;border-top-color:transparent;opacity:.7;animation:bsl-spin-kf .8s linear infinite}"
+            + ".bsl-loading{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;opacity:.65}"
             // Плашка MCP-менеджера (чужой плагин, классы dm-*) висит в том же
             // правом верхнем углу, где стоят кнопки файла, и закрывает их.
             // Сдвигаем плашку ниже полосы вкладок: своей настройкой плагин
@@ -1272,6 +1293,8 @@ window.__ModuleLoader__.load({
       // and Monaco just need bottom clearance to scroll above the composer.
 
       const loadDir = useCallback(async (path) => {
+        const key = path || "";
+        setLoadingDirs((prev) => { const s = new Set(prev); s.add(key); return s; });
         try {
           const data = await fetchJson("/bsl/tree?path=" + encodeURIComponent(path || ""));
           const dir = data.path;
@@ -1282,6 +1305,8 @@ window.__ModuleLoader__.load({
         } catch (e) {
           setTreeError(e?.message || String(e));
           return null;
+        } finally {
+          setLoadingDirs((prev) => { const s = new Set(prev); s.delete(key); return s; });
         }
       }, []);
 
@@ -1298,6 +1323,7 @@ window.__ModuleLoader__.load({
       // распознавание «файл ещё не в git»).
       const gitFilesRef = useRef(new Map());
       const refreshGit = useCallback(async (fresh = false) => {
+        setGitLoading(true);
         try {
           // fresh=true — из кнопки «Обновить дерево»: кэш статусов на хосте
           // сбрасывается, иначе список изменённых пятисекундной давности.
@@ -1310,7 +1336,15 @@ window.__ModuleLoader__.load({
             gitFilesRef.current = m;
             setGitFiles(m);
           }
-        } catch {}
+        } catch (e) {
+          // Хост отвечает 200 с причиной; 400/500 приходит исключением, но и в нём
+          // есть reason/detail — иначе список молча показывал «Нет изменённых файлов».
+          const body = e && e.body;
+          setGitWhy(String((body && body.reason) || ""));
+          setGitDetail(String((body && (body.detail || body.error)) || (e && e.message) || e || ""));
+        } finally {
+          setGitLoading(false);
+        }
       }, []);
 
       // ── Tabs: multiple open files, per-tab unsaved buffers ──────────────
@@ -2185,7 +2219,7 @@ window.__ModuleLoader__.load({
               encoding: encRef.current.get(path) || "utf-8",
             }),
           });
-          if (!res.ok) throw new Error("HTTP " + res.status);
+          if (!res.ok) throw await errorFromResponse(res);
           setDirty(false);
           markTabDirty(path, false);
           // Обновить известный mtime: наша же запись на диске не должна
@@ -2700,6 +2734,7 @@ window.__ModuleLoader__.load({
       gitFilterRef.current = gitFilter;
       const loadMeta = useCallback(async (key) => {
         setMetaLoading(true);
+        setMetaLoadingKey(key || "");
         try {
           // Фильтр берём из ref — колбэк всегда видит актуальное состояние.
           const changed = mode === "meta" && gitFilterRef.current ? "&changed=1" : "";
@@ -2714,6 +2749,7 @@ window.__ModuleLoader__.load({
           return null;
         } finally {
           setMetaLoading(false);
+          setMetaLoadingKey(null);
         }
       }, [mode]);
 
@@ -2912,6 +2948,10 @@ window.__ModuleLoader__.load({
         return jsx("span", { style: { color: gitStatusColor(st), marginLeft: 6, fontSize: 11 }, children: gitStatusLabel(st) });
       };
 
+      // Ожидание видно всегда одинаково: кружок плюс короткая подпись.
+      const spinner = (size) => jsx("span", { className: "bsl-spinner", style: { width: size || 11, height: size || 11 } });
+      const loadingRow = (text) => jsxs("div", { className: "bsl-loading", children: [spinner(), jsx("span", { children: text })] });
+
       const renderLevel = (dirPath, depth) => {
         const list = children.get(dirPath) || [];
         return list.map((e) => {
@@ -2954,10 +2994,17 @@ window.__ModuleLoader__.load({
                     ? iconBox(coloredFolder(isOpen))
                     : iconBox(coloredFile(e.name)),
                   jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: e.name }),
+                  isDir && loadingDirs.has(full) ? spinner() : null,
                   gitBadge(full, e.type),
                 ],
               }),
-              isOpen && children.has(full) ? renderLevel(full, depth + 1) : null,
+              isOpen
+                ? children.has(full)
+                  ? renderLevel(full, depth + 1)
+                  : loadingDirs.has(full)
+                  ? jsxs("div", { className: "bsl-loading", style: { paddingLeft: depth * 22 + 28 }, children: [spinner(), jsx("span", { children: "Читаем папку…" })] })
+                  : null
+                : null,
             ],
           });
         });
@@ -3152,8 +3199,11 @@ window.__ModuleLoader__.load({
             ]})
           : gitWhy === "status-failed"
           ? "git status не отработал: " + (gitDetail || "причина не сообщена")
+          : gitDetail
+          ? "Изменения не прочитаны: " + gitDetail
           : "Нет изменённых файлов";
       const renderGitList = () => {
+        if (gitLoading && !gitFiles.size) return loadingRow("Читаем изменения…");
         if (!gitFiles.size) {
           return jsx("div", { style: { padding: "6px 10px", fontSize: 12, opacity: 0.6, lineHeight: 1.4 }, children: emptyGitText() });
         }
@@ -3250,6 +3300,8 @@ window.__ModuleLoader__.load({
             ? renderMetaLevel(full, depth + 1)
             : item.items && item.items.length
             ? renderMetaRows(item.items, depth + 1)
+            : metaLoadingKey != null && metaLoadingKey === full
+            ? jsxs("div", { className: "bsl-loading", style: { paddingLeft: depth * 22 + 28 }, children: [spinner(), jsx("span", { children: "Читаем раздел…" })] })
             : null
           : null;
         return jsxs(React.Fragment, {
@@ -3269,6 +3321,7 @@ window.__ModuleLoader__.load({
                 jsx("span", { style: { textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, overflow: "hidden" }, children: item.label }),
                 item.hint ? jsx("span", { style: { marginLeft: 6, fontSize: 11, opacity: 0.55, flexShrink: 0, fontStyle: "italic" }, children: item.hint }) : null,
                 item.count ? jsx("span", { style: { marginLeft: "auto", flexShrink: 0, fontSize: 11, opacity: 0.5 }, children: item.count }) : null,
+                metaLoadingKey != null && metaLoadingKey === full ? spinner() : null,
                 gitBadge(item.file, "file"),
               ],
             }),
@@ -3284,11 +3337,17 @@ window.__ModuleLoader__.load({
           return jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Метаданные: " + (metaInfo.error || "не найдены") });
         }
         if (metaError) {
-          return jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + metaError });
+          return jsxs("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: [
+            jsx("div", { children: "Метаданные: " + metaError }),
+            // Причина «конфигурация не найдена» означает не поломку, а не ту папку:
+            // без подсказки человек ищет дефект там, где его нет.
+            /не найдена/i.test(metaError)
+              ? jsx("div", { style: { marginTop: 4, opacity: 0.75 }, children: "Откройте папку выгрузки конфигурации (ConfigDumpInfo.xml) или проект EDT (Configuration.mdo)." })
+              : null,
+          ]});
         }
-        if (metaLoading && !metaChildren.has("")) {
-          return jsx("div", { style: { padding: "4px 10px", fontSize: 12, opacity: 0.6 }, children: "Загрузка метаданных…" });
-        }
+        if (metaLoading && !metaChildren.has("")) return loadingRow("Читаем метаданные…");
+        if (!metaChildren.has("") && metaInfo == null) return loadingRow("Смотрим конфигурацию…");
         if (!metaChildren.has("")) return null;
         return renderMetaLevel("", 0);
       };
@@ -3456,7 +3515,7 @@ window.__ModuleLoader__.load({
                   cursor: refreshBusy ? "wait" : "pointer", background: "transparent", color: "#8a94a6",
                   padding: 0, opacity: refreshBusy ? 0.5 : 1,
                 },
-                children: jsx("svg", { width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
+                children: jsx("svg", { className: refreshBusy ? "bsl-spin" : undefined, width: 13, height: 13, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round", strokeLinejoin: "round", children: [
                   jsx("polyline", { points: "23 4 23 10 17 10" }),
                   jsx("path", { d: "M20.49 15a9 9 0 1 1-2.12-9.36L23 10" }),
                 ] }),
@@ -3506,7 +3565,7 @@ window.__ModuleLoader__.load({
             ? renderGitList()
             : jsxs(React.Fragment, { children: [
                 treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 11, color: "#f44336", whiteSpace: "pre-wrap" }, children: "Ошибка: " + treeError }) : null,
-                !rootPath && !treeError ? jsx("div", { style: { padding: "4px 10px", fontSize: 12, opacity: 0.6 }, children: "Загрузка…" }) : null,
+                !rootPath && !treeError ? loadingRow("Читаем папку проекта…") : null,
                 renderLevel(rootPath, 0),
               ] }) }),
         ]}),
