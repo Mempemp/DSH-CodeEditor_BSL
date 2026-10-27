@@ -3671,6 +3671,17 @@ window.__ModuleLoader__.load({
           .catch((e) => { if (alive) setGitInfo({ ok: false, error: String(e?.message || e) }); });
         return () => { alive = false; };
       }, []);
+      // Журнал отказов рядом с настройками: причину не надо пересказывать словами
+      // и не надо ждать, пока человек её найдёт на экране.
+      const [errorsInfo, setErrorsInfo] = React.useState(null);
+      const [logBusy, setLogBusy] = React.useState(false);
+      const loadErrors = React.useCallback(async () => {
+        setLogBusy(true);
+        try { setErrorsInfo(await fetchJson("/bsl/errors?tail=30")); }
+        catch (e) { setErrorsInfo({ ok: false, error: String(e?.message || e) }); }
+        finally { setLogBusy(false); }
+      }, []);
+      React.useEffect(() => { loadErrors(); }, [loadErrors]);
       // Кнопка и сохраняет путь, и проверяет его же — иначе значение на экране
       // и значение, которым работает проверка, могут разойтись.
       const checkGit = async () => {
@@ -3773,6 +3784,24 @@ window.__ModuleLoader__.load({
             jsx("div", { style: { opacity: 0.6, fontSize: 11, lineHeight: 1.4 }, children: "Сколько ждать git status и diff. На большой выгрузке и сетевом диске ставьте больше: 600–1800." }),
           ]}),
           jsx("div", { children: jsx("button", { onClick: checkGit, disabled: gitBusy, style: { height: 28, padding: "0 14px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: gitBusy ? "wait" : "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: gitBusy ? "Проверяем…" : "Проверить снова" }) }),
+        ]}),
+        jsxs("div", { style: { borderTop: "1px solid var(--dsw-alias-border-l2)", marginTop: 2, paddingTop: 10, display: "flex", flexDirection: "column", gap: 6 }, children: [
+          jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8 }, children: [
+            jsx("span", { children: "Журнал ошибок" }),
+            errorsInfo && errorsInfo.exists ? jsx("span", { style: { opacity: 0.55, fontSize: 11 }, children: "записей: " + errorsInfo.total }) : null,
+          ]}),
+          errorsInfo?.file ? jsx("code", { style: { display: "block", opacity: 0.7, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }, children: errorsInfo.file }) : null,
+          errorsInfo?.ok && errorsInfo.exists && errorsInfo.lines?.length
+            ? jsx("div", { style: { display: "flex", flexDirection: "column", gap: 3, fontSize: 11, lineHeight: 1.35, maxHeight: 132, overflowY: "auto" }, children: errorsInfo.lines.slice(-8).reverse().map((l, i) => jsxs("div", { style: { display: "flex", gap: 6 }, children: [
+                jsx("span", { style: { opacity: 0.5, flexShrink: 0 }, children: String(l.at || "").slice(11, 19) }),
+                jsx("span", { style: { opacity: 0.75, flexShrink: 0 }, children: (l.route || "—") + " " + (l.status || "") }),
+                jsx("span", { title: String(l.message || ""), style: { color: "#e2c08d", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: l.message }),
+              ], key: String(l.at || "") + i })) })
+            : jsx("div", { style: { opacity: 0.6, fontSize: 11 }, children: errorsInfo == null ? "Читаем журнал…" : errorsInfo.exists ? "Ошибок нет" : "Журнал ещё не создан" }),
+          jsxs("div", { style: { display: "flex", gap: 8 }, children: [
+            jsx("button", { onClick: () => loadErrors(), disabled: logBusy, style: { height: 28, padding: "0 14px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: logBusy ? "wait" : "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: logBusy ? "Читаем…" : "Обновить" }),
+            jsx("button", { onClick: async () => { try { await fetchJson("/bsl/open-log-dir", { method: "POST" }); } catch (e) { setErrorsInfo((prev) => ({ ...(prev || {}), error: String(e?.message || e) })); } }, style: { height: 28, padding: "0 14px", border: "1px solid var(--dsw-alias-border-l2)", borderRadius: 8, cursor: "pointer", background: "transparent", color: "inherit", font: "var(--dsw-font-s-14)" }, children: "Открыть папку журнала" }),
+          ]}),
         ]}),
         jsx("div", { style: { display: "flex", alignItems: "center", gap: 10 }, children: [
           jsx("button", { onClick: save, style: { height: 28, padding: "0 16px", border: "none", borderRadius: 8, cursor: "pointer", background: "var(--dsw-alias-state-business-primary, #3964fe)", color: "#fff", font: "var(--dsw-font-s-14)" }, children: "Сохранить" }),

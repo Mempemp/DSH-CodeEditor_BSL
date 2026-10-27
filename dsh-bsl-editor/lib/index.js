@@ -8,7 +8,7 @@
 // The browser half loads Monaco from a CDN and talks to the LSP server
 // directly over a native WebSocket.
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, openSync, promises as fs, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, promises as fs, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { join, relative, normalize, isAbsolute } from "node:path";
@@ -50,6 +50,10 @@ const DEFAULT_BIN = join(
 
 const LOG_DIR = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "dsh-bsl-editor");
 const LOG_FILE = join(LOG_DIR, "server.log");
+// Журнал отказов: причина остаётся на диске, а не только на экране. Без него разбор
+// сводится к пересказу текста ошибки человеком — «вылез HTTP 400» и всё.
+const ERRORS_FILE = join(LOG_DIR, "errors.log");
+const ERRORS_MAX_BYTES = 2 * 1024 * 1024;
 const CONFIG_FILE = join(LOG_DIR, "bsl-language-server.json");
 // User settings saved from the in-tab settings panel (override the defaults).
 const PLUGIN_CONFIG_FILE = join(LOG_DIR, "plugin-config.json");
@@ -186,9 +190,42 @@ async function resolveInside(root, requested) {
   return abs;
 }
 
+// Один отказ — одна строка JSON: время, маршрут, код, причина. Файл растёт
+// ограниченно: перевалил за 2 МБ — уезжает в errors.log.1, старое затирается.
+let lastFailureKey = "";
+let lastFailureAt = 0;
+
+function logFailure(entry) {
+  try {
+    // Клиент повторяет запросы (статус, метаданные) — одна и та же причина не
+    // должна появляться в журнале десятки раз подряд.
+    const key = [entry.route, entry.status, entry.reason, entry.message].join("|");
+    if (key === lastFailureKey && Date.now() - lastFailureAt < 60_000) return;
+    lastFailureKey = key;
+    lastFailureAt = Date.now();
+    mkdirSync(LOG_DIR, { recursive: true });
+    const st = statSync(ERRORS_FILE, { throwIfNoEntry: false });
+    if (st && st.size > ERRORS_MAX_BYTES) renameSync(ERRORS_FILE, ERRORS_FILE + ".1");
+    appendFileSync(ERRORS_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\r\n");
+  } catch {}
+}
+
 function json(res, code, obj) {
   res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(obj));
+  // Любой ответ с кодом ошибки попадает в журнал сам: экран можно закрыть, а
+  // строку на диске — прочитать. Успешные ответы не пишем, иначе журнал тонет.
+  // Иконки метаданных запрашиваются пачкой, и «нет такой картинки» — не поломка
+  // функции: журнал не должен тонуть в 404 от набора иконок.
+  if (code >= 400 && res.__bslRoute !== "/bsl/icons") {
+    const body = obj || {};
+    logFailure({
+      route: res.__bslRoute || "",
+      status: code,
+      reason: body.reason || "",
+      message: String(body.error || body.detail || ""),
+    });
+  }
 }
 
 async function handleTree(root, url, res) {
@@ -688,6 +725,9 @@ async function handleGitStatus(root, res, opts) {
   if (!r.ok) {
     // Причину называет сам git: «не отработал» без его слов не объясняет ничего.
     const repo = await runGit(root, ["rev-parse", "--show-toplevel"]);
+    // Отказ git — это 200 с полем reason, мимо обработчика ошибок в json(). Но
+    // разбирать его нужно так же, поэтому пишем в журнал руками.
+    if (r.error) logFailure({ route: "/bsl/git-status", status: 200, reason: repo.ok ? "status-failed" : "no-repo", message: r.error });
     return json(res, 200, {
       ok: false,
       files: [],
@@ -1458,11 +1498,22 @@ export function apply(ctx, config) {
   // Warm the filename index in the background so the first search is instant.
   ensureIndex(root).catch(() => {});
 
-  ctx.webServer.register({
+  // Каждый маршрут проходит через обёртку: ответ помечается своим путём, чтобы
+  // журнал отказов говорил, какой именно запрос не отработал, а не «что-то упало».
+  const reg = (spec) => ctx.webServer.register({
+    ...spec,
+    handler: (req, res) => {
+      res.__bslRoute = spec.path;
+      return spec.handler(req, res);
+    },
+  });
+
+
+  reg({
     kind: "exact", path: "/bsl/lsp-status",
     handler: (_req, res) => json(res, 200, { state, reason, port: config.serverPort, logFile: LOG_FILE }),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/lsp-start",
     handler: async (_req, res) => {
       // Never spawn when LSP is disabled in settings — the client also
@@ -1488,7 +1539,7 @@ export function apply(ctx, config) {
       json(res, 202, { ok: up, state: up ? "running" : state, reason: up ? "" : reason, port: config.serverPort });
     },
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/workspaces",
     handler: (_req, res) => {
       const cur = workspaces.find((w) => w.path === root);
@@ -1498,7 +1549,7 @@ export function apply(ctx, config) {
   });
   // The client re-points the editor root at the ACTIVE session's cwd when the
   // user switches chats/workspaces (session.cwd from the client sessions list).
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/set-workspace",
     handler: async (req, res) => {
       try {
@@ -1516,7 +1567,7 @@ export function apply(ctx, config) {
       }
     },
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/logs",
     handler: (_req, res) => {
       try {
@@ -1527,7 +1578,40 @@ export function apply(ctx, config) {
       }
     },
   });
-  ctx.webServer.register({
+  // Что упало в последний раз. Читаем из журнала, а не из памяти: после
+  // перезапуска причина тоже должна быть на месте.
+  reg({
+    kind: "exact", path: "/bsl/errors",
+    handler: (req, res) => {
+      const want = Number(new URL(req.url, "http://x").searchParams.get("tail") || 20);
+      const n = Math.min(Math.max(Number.isFinite(want) ? want : 20, 1), 200);
+      let lines = [];
+      let exists = false;
+      let total = 0;
+      try {
+        const all = readFileSync(ERRORS_FILE, "utf-8").split(/\r?\n/).filter(Boolean);
+        exists = true;
+        total = all.length;
+        lines = all.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { at: "", message: l }; } });
+      } catch {}
+      json(res, 200, { ok: true, file: ERRORS_FILE, dir: LOG_DIR, exists, total, lines });
+    },
+  });
+  // Показать журнал в проводнике: путь копировать руками человек не должен.
+  reg({
+    kind: "exact", path: "/bsl/open-log-dir",
+    handler: (_req, res) => {
+      try {
+        mkdirSync(LOG_DIR, { recursive: true });
+        const child = spawn("explorer", [LOG_DIR], { detached: true, stdio: "ignore" });
+        child.unref();
+        json(res, 200, { ok: true, dir: LOG_DIR });
+      } catch (e) {
+        json(res, 500, { ok: false, error: e?.message || String(e) });
+      }
+    },
+  });
+  reg({
     kind: "exact", path: "/bsl/config",
     handler: (_req, res) => json(res, 200, {
       lspEnabled: config.lspEnabled,
@@ -1540,7 +1624,7 @@ export function apply(ctx, config) {
       gitReadTimeoutSec: Math.round(gitTimeoutFor(["status"]) / 1000),
     }),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/config-save",
     handler: (req, res) => {
       let body = "";
@@ -1567,99 +1651,99 @@ export function apply(ctx, config) {
       });
     },
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/grammar",
     handler: (req, res) => handleGrammar(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/tree",
     handler: (req, res) => handleTree(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/search",
     handler: (req, res) => handleSearch(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/read",
     handler: (req, res) => handleRead(root, new URL(req.url, "http://x"), res, config),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/stat",
     handler: (req, res) => handleStat(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/vendor",
     handler: (req, res) => handleVendor(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/write",
     handler: (req, res) => handleWrite(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/git-status",
     handler: (req, res) => handleGitStatus(root, res, { fresh: new URL(req.url, "http://x").searchParams.get("fresh") === "1" }),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/git-diff",
     handler: (req, res) => handleGitDiff(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/revert-hunk",
     handler: (req, res) => handleRevertHunk(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/revert-file",
     handler: (req, res) => handleRevertFile(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/reviewed",
     handler: (req, res) => handleReviewed(root, req, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/stage",
     handler: (req, res) => handleStage(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/stage-all",
     handler: (req, res) => handleStageAll(root, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/staged",
     handler: (_req, res) => handleStaged(root, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/commit",
     handler: (req, res) => handleCommit(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/meta/status",
     handler: (req, res) => handleMetaStatus(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/meta/list",
     handler: (req, res) => handleMetaList(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/meta/search",
     handler: (req, res) => handleMetaSearch(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/refresh",
     handler: (req, res) => handleRefreshAll(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/git-info",
     handler: (req, res) => handleGitInfo(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "exact", path: "/bsl/git-init",
     handler: (req, res) => handleGitInit(root, req, res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/find-symbol",
     handler: (req, res) => handleFindSymbol(root, new URL(req.url, "http://x"), res),
   });
-  ctx.webServer.register({
+  reg({
     kind: "prefix", path: "/bsl/icons",
     handler: (req, res) => handleIcon(root, new URL(req.url, "http://x"), res),
   });
