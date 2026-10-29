@@ -86,16 +86,16 @@ F12 обрабатывает плагин; нативный Ctrl+Click Monaco н
 
 ## Установка
 
-Скачайте `dsh-bsl-editor-0.9.3.tgz` из последнего релиза GitHub (или соберите сами: `cd dsh-bsl-editor && npm pack`) и установите:
+Скачайте `dsh-bsl-editor-0.9.5.tgz` из последнего релиза GitHub (или соберите сами: `cd dsh-bsl-editor && npm pack`) и установите:
 
 ```sh
-dsh plugin --profile web add dsh-bsl-editor-0.9.3.tgz
+dsh plugin --profile web add dsh-bsl-editor-0.9.5.tgz
 ```
 
 Либо по прямой ссылке на архив релиза:
 
 ```sh
-dsh plugin --profile web add https://github.com/Mempemp/DSH-CodeEditor_BSL/releases/download/v0.9.3/dsh-bsl-editor-0.9.3.tgz
+dsh plugin --profile web add https://github.com/Mempemp/DSH-CodeEditor_BSL/releases/download/v0.9.5/dsh-bsl-editor-0.9.5.tgz
 ```
 
 Затем перезапустите `dsh web` (host-часть) и обновите вкладку браузера (Ctrl+Shift+R).
